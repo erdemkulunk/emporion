@@ -52,7 +52,7 @@ app.*.map.json
 
 # Custom
 TODO.txt
-data
+/data
 node_modules/
 
 # FVM Version Cache
