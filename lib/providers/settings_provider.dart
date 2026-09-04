@@ -341,6 +341,7 @@ class SettingsProvider with ChangeNotifier {
     required String appId,
     required List<String> artifactPaths,
     int? expectedVersionCode,
+    String? expectedVersion,
     bool selfUpdate = false,
   }) async {
     await prefs?.setString(
@@ -349,6 +350,7 @@ class SettingsProvider with ChangeNotifier {
         'appId': appId,
         'artifactPaths': artifactPaths,
         'expectedVersionCode': expectedVersionCode,
+        'expectedVersion': expectedVersion,
         'selfUpdate': selfUpdate,
         'createdAt': DateTime.now().toUtc().toIso8601String(),
       }),

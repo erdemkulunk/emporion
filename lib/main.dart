@@ -348,11 +348,25 @@ class _ObtainiumState extends State<Obtainium> {
       return;
     }
     final expectedVersionCode = pending['expectedVersionCode'] as int?;
+    final expectedVersion = pending['expectedVersion'] as String?;
     final installed = await getInstalledInfo(appId);
     if (installed != null &&
         expectedVersionCode != null &&
         (installed.versionCode ?? -1) >= expectedVersionCode) {
+      await apps.ready;
+      final stored = apps.apps[appId]?.app;
+      final completedVersion = expectedVersion ?? installed.versionName;
+      if (stored != null &&
+          completedVersion != null &&
+          stored.installedVersion != completedVersion) {
+        await apps.saveApps(
+          [stored.copyWith(installedVersion: completedVersion)],
+          attemptToCorrectInstallStatus: false,
+          reuseInstalledInfo: true,
+        );
+      }
       await settings.clearPendingInstall();
+      await notifications.cancel(9011);
       AppLogger.info('Reconciled completed pending install for $appId');
       return;
     }

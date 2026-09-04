@@ -1107,6 +1107,7 @@ extension AppsProviderInstall on AppsProvider {
     final verifiedInstallOptions = <String, dynamic>{
       ...installOptions,
       'expectedVersionCode': newVersionCode,
+      'expectedVersion': apps[file.appId]!.app.latestVersion,
       'selfUpdate': isSelfUpdate,
     };
     final installer = getInstaller();

@@ -98,6 +98,7 @@ class StockInstaller extends Installer {
       appId: appId,
       artifactPaths: apkFilePaths,
       expectedVersionCode: installOptions['expectedVersionCode'] as int?,
+      expectedVersion: installOptions['expectedVersion'] as String?,
       selfUpdate: installOptions['selfUpdate'] == true,
     );
     try {
