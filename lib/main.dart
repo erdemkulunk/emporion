@@ -355,7 +355,8 @@ class _ObtainiumState extends State<Obtainium> {
         (installed.versionCode ?? -1) >= expectedVersionCode) {
       await apps.ready;
       final stored = apps.apps[appId]?.app;
-      final completedVersion = expectedVersion ?? installed.versionName;
+      final completedVersion =
+          expectedVersion ?? stored?.latestVersion ?? installed.versionName;
       if (stored != null &&
           completedVersion != null &&
           stored.installedVersion != completedVersion) {
