@@ -23,12 +23,12 @@ assignees: ''
 4. See error -->
 
 **Screenshots and Logs**
-<!-- If applicable, add screenshots, logs, and any other artifacts (like some/all files under `/Android/data/dev.imranr.obtainium/`) that you think may help troubleshoot the issue. -->
+<!-- If applicable, add screenshots, logs, and any other artifacts (like some/all files under `/Android/data/dev.erdem.emporion/`) that you think may help troubleshoot the issue. -->
 
 **Please complete the following information:**
  - Device: <!-- [e.g. Pixel 7] -->
  - OS: <!-- [e.g. GrapheneOS] -->
- - Obtainium Version: <!-- [e.g. 0.14.6-beta] -->
+ - Emporion Version: <!-- [e.g. 1.0.0] -->
 
 **Additional context**
 <!-- Add any other context about the problem here. -->

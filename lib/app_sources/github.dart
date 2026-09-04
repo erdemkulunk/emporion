@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:easy_localization/easy_localization.dart';
 import 'package:http/http.dart';
+import 'package:obtainium/catalog/accounts/credential_store.dart';
+import 'package:obtainium/catalog/models.dart';
 import 'package:obtainium/utils/string_compare.dart';
 import 'package:obtainium/components/generated_form_model.dart';
 import 'package:obtainium/custom_errors.dart';
@@ -27,14 +29,6 @@ class GitHub extends AppSource {
 
   @override
   List<GeneratedFormItem> get sourceConfigSettingFormItems => [
-    GeneratedFormTextField(
-      'github-creds',
-      label: tr('githubPATLabel'),
-      password: true,
-      required: false,
-      helpUrl:
-          'https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token',
-    ),
     GeneratedFormTextField(
       'GHReqPrefix',
       label: tr('GHReqPrefix'),
@@ -247,10 +241,10 @@ class GitHub extends AppSource {
     // after the token was rejected for this repository); see #3211.
     final token = additionalSettings['skipAuth'] == true
         ? null
-        : await getTokenIfAny(additionalSettings);
+        : await getTokenIfAny(additionalSettings, url: url);
     final headers = <String, String>{};
     if (token != null && token.isNotEmpty) {
-      headers[HttpHeaders.authorizationHeader] = 'Token $token';
+      headers[HttpHeaders.authorizationHeader] = 'Bearer $token';
     }
     if (forAPKDownload == true) {
       headers[HttpHeaders.acceptHeader] = 'application/octet-stream';
@@ -262,37 +256,28 @@ class GitHub extends AppSource {
     }
   }
 
-  Future<String?> getTokenIfAny(Map<String, dynamic> additionalSettings) async {
-    final SettingsProvider settingsProvider = SettingsProvider();
-    await settingsProvider.initializeSettings();
-    final sourceConfig = await getSourceConfigValues(
-      additionalSettings,
-      settingsProvider,
+  Future<String?> getTokenIfAny(
+    Map<String, dynamic> additionalSettings, {
+    required String url,
+  }) async {
+    final accountId = additionalSettings['accountId'] as String?;
+    if (accountId == null || accountId.isEmpty) return null;
+    final providerName =
+        additionalSettings['accountProvider'] as String? ??
+        (hostChanged ? ProviderKind.forgejo.name : ProviderKind.github.name);
+    final provider = ProviderKind.values.byName(providerName);
+    final accountHost =
+        additionalSettings['accountHost'] as String? ?? Uri.parse(url).host;
+    return const CredentialStore().getByIdentity(
+      accountId: accountId,
+      provider: provider,
+      host: accountHost,
     );
-    String? creds = sourceConfig['github-creds'];
-    if ((additionalSettings['GHReqPrefix'] as String? ?? '').isNotEmpty) {
-      creds = null;
-    }
-    if (creds != null) {
-      final userNameEndIndex = creds.indexOf(':');
-      if (userNameEndIndex > 0) {
-        creds = creds.substring(
-          userNameEndIndex + 1,
-        ); // For old username-included token inputs
-      }
-      return creds;
-    } else {
-      return null;
-    }
   }
 
   @override
-  Future<String?> getSourceNote() async {
-    if (!hostChanged && (await getTokenIfAny({})) == null) {
-      return '${tr('githubSourceNote')} ${hostChanged ? tr('addInfoBelow') : tr('addInfoInSettings')}';
-    }
-    return null;
-  }
+  Future<String?> getSourceNote() async =>
+      '${tr('githubSourceNote')} ${hostChanged ? tr('addInfoBelow') : tr('addInfoInSettings')}';
 
   @override
   Future<String> generalReqPrefetchModifier(
@@ -314,8 +299,8 @@ class GitHub extends AppSource {
   static bool _isAuthRejection(Response res) {
     if (res.statusCode != 401 && res.statusCode != 403) return false;
     try {
-      final message =
-          (jsonDecode(res.body)['message'] as String? ?? '').toLowerCase();
+      final message = (jsonDecode(res.body)['message'] as String? ?? '')
+          .toLowerCase();
       return message.contains('access token') ||
           message.contains('bad credentials');
     } catch (_) {

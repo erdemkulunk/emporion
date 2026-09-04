@@ -15,6 +15,8 @@ import 'package:crypto/crypto.dart';
 import 'package:easy_localization/easy_localization.dart';
 import 'package:flutter/material.dart';
 import 'package:http/io_client.dart';
+import 'package:obtainium/catalog/catalog_provider.dart';
+import 'package:obtainium/catalog/data/catalog_database.dart';
 import 'package:obtainium/custom_errors.dart';
 import 'package:obtainium/core/logging/app_logger.dart';
 import 'package:obtainium/providers/notifications_provider.dart';
@@ -47,6 +49,7 @@ const int _maxDownloadPolls = 43;
 const int _downloadPollIntervalSeconds = 7;
 const int _progressUpdateIntervalMs = 500;
 const int _downloadBufferSize = 32 * 1024;
+const int maxArtifactDownloadBytes = 2 * 1024 * 1024 * 1024;
 const int _downloadProgressFallback = 30;
 const int _bgUpdateMaxAttempts = 4;
 const int _bgUpdateMaxRetryWaitSeconds = 30;
@@ -378,9 +381,21 @@ Future<File> downloadFile(
   CancellationToken? cancellationToken,
 }) async {
   final reqHeaders = headers ?? {};
-  final headersClient = IOClient(await createHttpClient(additionalSettings));
   final url = additionalSettings['url'] as String;
-  final getReq = Request('GET', Uri.parse(url));
+  final uri = Uri.parse(url);
+  final allowInsecure = additionalSettings['allowInsecure'] == true;
+  if (!uri.isAbsolute ||
+      uri.host.isEmpty ||
+      (uri.scheme != 'https' && !(allowInsecure && uri.scheme == 'http')) ||
+      uri.userInfo.isNotEmpty) {
+    throw ObtainiumError(
+      allowInsecure
+          ? 'Only credential-free HTTP(S) artifact URLs are allowed'
+          : 'A credential-free HTTPS artifact URL is required',
+    )..url = url;
+  }
+  final headersClient = IOClient(await createHttpClient(additionalSettings));
+  final getReq = Request('GET', uri)..followRedirects = false;
   getReq.headers.addAll(reqHeaders);
   final headersResponse = await headersClient.send(getReq);
 
@@ -406,6 +421,10 @@ Future<File> downloadFile(
   } else if (ext == 'attachment') {
     ext = 'apk';
   }
+  ext = ext.trim().toLowerCase();
+  if (!RegExp(r'^[a-z0-9]{1,8}$').hasMatch(ext)) {
+    ext = 'apk';
+  }
   // Never trust a source-provided fileName: always reduce it to a plain
   // basename so it cannot escape destDir, whatever the caller passed.
   fileName = fileName.replaceAll('\\', '/').split('/').last;
@@ -428,6 +447,11 @@ Future<File> downloadFile(
   // If you have an existing file that is usable,
   // decide whether you can use it (either return full or resume partial)
   final fullContentLength = headersResponse.contentLength;
+  if (fullContentLength != null &&
+      fullContentLength > maxArtifactDownloadBytes) {
+    throw ObtainiumError('Artifact exceeds the 2 GiB download limit')
+      ..url = url;
+  }
   if (useExisting && downloadedFile.existsSync()) {
     final length = downloadedFile.lengthSync();
     if (fullContentLength == null || !rangeFeatureEnabled) {
@@ -486,6 +510,12 @@ Future<File> downloadFile(
   final HttpClient responseClient = responseWithClient.value.key;
   final HttpClientResponse response = responseWithClient.value.value;
   try {
+    final responseLength = response.contentLength;
+    if (responseLength >= 0 &&
+        responseLength + rangeStart > maxArtifactDownloadBytes) {
+      throw ObtainiumError('Artifact exceeds the 2 GiB download limit')
+        ..url = url;
+    }
     // If we requested a byte range to resume a partial download but the server
     // ignored it and returned the full file (200 instead of 206 Partial
     // Content), appending would corrupt the file - discard the partial data and
@@ -540,6 +570,10 @@ Future<File> downloadFile(
           .map((chunk) {
             cancellationToken?.throwIfCancelled();
             received += chunk.length;
+            if (received > maxArtifactDownloadBytes) {
+              throw ObtainiumError('Artifact exceeds the 2 GiB download limit')
+                ..url = url;
+            }
             final now = DateTime.now();
             if (onProgress != null &&
                 (lastProgressUpdate == null ||
@@ -757,6 +791,8 @@ class AppsProvider with ChangeNotifier {
   Stream<FGBGType>? foregroundStream;
   StreamSubscription<FGBGType>? foregroundSubscription;
   late final SettingsProvider settingsProvider;
+  late final CatalogDatabase catalogDatabase;
+  CatalogProvider? catalogProvider;
   Directory? _apkDir;
   Directory? _iconsCacheDir;
   Directory? cachedAppsDir;
@@ -831,24 +867,29 @@ class AppsProvider with ChangeNotifier {
     }
   }
 
-  /// Schedules a debounced automatic export. Coalesces the many per-app
-  /// save/remove operations that happen in bursts into a single export.
-  /// No-op (cheaply returns) if auto-export is disabled inside [export].
+  /// Coalesces mutations into one private portable snapshot and, when enabled,
+  /// one user-selected Storage Access Framework export.
   void scheduleAutoExport() {
     _autoExportDebounce?.cancel();
-    _autoExportDebounce = Timer(const Duration(seconds: 2), () {
-      if (!_disposed) {
-        export(isAuto: true).catchError((e) {
-          AppLogger.warn('Auto-export failed: $e');
-          return null;
-        });
+    _autoExportDebounce = Timer(const Duration(seconds: 2), () async {
+      if (_disposed) return;
+      try {
+        await writePortableBackup();
+        await export(isAuto: true);
+      } catch (error) {
+        AppLogger.warn('Automatic portable backup failed: $error');
       }
     });
   }
 
-  AppsProvider({bool isBg = false, SettingsProvider? settingsProvider}) {
+  AppsProvider({
+    bool isBg = false,
+    SettingsProvider? settingsProvider,
+    CatalogDatabase? catalogDatabase,
+  }) {
     _isBg = isBg;
     this.settingsProvider = settingsProvider ?? SettingsProvider();
+    this.catalogDatabase = catalogDatabase ?? CatalogDatabase();
     // Subscribe to changes in the app foreground status
     foregroundStream = FGBGEvents.instance.stream.asBroadcastStream();
     foregroundSubscription = foregroundStream?.listen((event) async {
@@ -868,6 +909,9 @@ class AppsProvider with ChangeNotifier {
     }
     () async {
       await this.settingsProvider.initializeSettings();
+      if (!_isBg) {
+        this.settingsProvider.addListener(scheduleAutoExport);
+      }
       var useExternalCache = false;
       try {
         final cacheDirs = await getExternalCacheDirectories();
@@ -890,10 +934,10 @@ class AppsProvider with ChangeNotifier {
           _iconsCacheDir!.createSync();
         }
       }
+      loadingApps = true;
+      if (!isBg) notify();
+      await loadApps();
       if (!isBg) {
-        loadingApps = true;
-        notify();
-        await loadApps();
         final cutoff = DateTime.now().subtract(const Duration(days: 7));
         await for (var entity in apkDir.list()) {
           if (entity is File &&
@@ -904,8 +948,9 @@ class AppsProvider with ChangeNotifier {
             }
           }
         }
-        _readyCompleter.complete();
+        scheduleAutoExport();
       }
+      if (!_readyCompleter.isCompleted) _readyCompleter.complete();
     }().catchError((e) {
       if (!_readyCompleter.isCompleted) _readyCompleter.completeError(e);
       initError = e.toString();
@@ -923,6 +968,7 @@ class AppsProvider with ChangeNotifier {
     }
     _downloadCancellations.clear();
     _disposed = true;
+    settingsProvider.removeListener(scheduleAutoExport);
     foregroundSubscription?.cancel();
     _autoExportDebounce?.cancel();
     _eventSubscription?.cancel();

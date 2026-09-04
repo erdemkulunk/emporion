@@ -5,10 +5,11 @@ import 'package:android_intent_plus/android_intent.dart';
 import 'package:android_intent_plus/flag.dart';
 import 'package:android_package_manager/android_package_manager.dart';
 import 'package:archive/archive.dart' as archive;
+import 'package:crypto/crypto.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:easy_localization/easy_localization.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_archive/flutter_archive.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_fgbg/flutter_fgbg.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import 'package:obtainium/components/app_detail_widgets.dart';
@@ -58,6 +59,317 @@ const int _bgInstallConfirmAttempts = 20; // 20 × 500ms = 10 seconds
 // while the user was at a system prompt) must never stall the install chain.
 const int _installConfirmPollAttempts = 300; // 300 × 1s ≈ 5 minutes
 const Duration _installConfirmTimeout = Duration(minutes: 10);
+
+String _normalizedCertificateDigest(String value) =>
+    value.replaceAll(':', '').trim().toUpperCase();
+
+Set<String> _currentCertificateDigests(PackageInfo info) {
+  final signatures = info.signingInfo?.apkContentSigners;
+  return signatures
+          ?.map(
+            (signature) => _normalizedCertificateDigest(
+              sha256.convert(signature).toString(),
+            ),
+          )
+          .toSet() ??
+      const {};
+}
+
+Set<String> _certificateLineageDigests(PackageInfo info) {
+  final signingInfo = info.signingInfo;
+  final signatures = signingInfo?.hasMultipleSigners == true
+      ? signingInfo?.apkContentSigners
+      : signingInfo?.signingCertificateHistory;
+  return signatures
+          ?.map(
+            (signature) => _normalizedCertificateDigest(
+              sha256.convert(signature).toString(),
+            ),
+          )
+          .toSet() ??
+      _currentCertificateDigests(info);
+}
+
+const MethodChannel _artifactVerifierChannel = MethodChannel(
+  'dev.erdem.emporion/artifact_verifier',
+);
+
+Future<({Set<String> current, Set<String> lineage})> _nativeSignerDigests(
+  String method,
+  Map<String, Object?> arguments,
+) async {
+  try {
+    final result = await _artifactVerifierChannel
+        .invokeMapMethod<String, dynamic>(method, arguments);
+    if (result == null) {
+      return (current: const <String>{}, lineage: const <String>{});
+    }
+    Set<String> values(String key) => (result[key] as List? ?? const [])
+        .map((value) => _normalizedCertificateDigest(value.toString()))
+        .toSet();
+    return (current: values('current'), lineage: values('lineage'));
+  } on MissingPluginException {
+    return (current: const <String>{}, lineage: const <String>{});
+  }
+}
+
+Future<Set<String>> _archiveCurrentSigners(File file, PackageInfo info) async {
+  final current = _currentCertificateDigests(info);
+  if (current.isNotEmpty) return current;
+  return (await _nativeSignerDigests('archiveSigners', {
+    'path': file.path,
+  })).current;
+}
+
+Future<Set<String>> _archiveSigningLineage(File file, PackageInfo info) async {
+  final lineage = _certificateLineageDigests(info);
+  if (lineage.isNotEmpty) return lineage;
+  return (await _nativeSignerDigests('archiveSigners', {
+    'path': file.path,
+  })).lineage;
+}
+
+Future<Set<String>> _installedSigningLineage(
+  String packageName,
+  PackageInfo info,
+) async {
+  final lineage = _certificateLineageDigests(info);
+  if (lineage.isNotEmpty) return lineage;
+  return (await _nativeSignerDigests('installedSigners', {
+    'packageName': packageName,
+  })).lineage;
+}
+
+Future<void> verifyDownloadedArtifact(App app, File artifact) async {
+  final actualSize = await artifact.length();
+  if (actualSize > maxArtifactDownloadBytes) {
+    await artifact.delete();
+    throw ObtainiumError('Artifact exceeds the 2 GiB download limit')
+      ..url = app.url;
+  }
+  if (app.expectedSize != null && actualSize != app.expectedSize) {
+    await artifact.delete();
+    throw ObtainiumError(
+      'Artifact size mismatch: expected ${app.expectedSize}, received $actualSize bytes',
+    )..url = app.url;
+  }
+  if (app.expectedSha256 != null) {
+    final digest = await sha256.bind(artifact.openRead()).first;
+    if (_normalizedCertificateDigest(digest.toString()) !=
+        _normalizedCertificateDigest(app.expectedSha256!)) {
+      await artifact.delete();
+      throw ObtainiumError('Artifact SHA-256 mismatch')..url = app.url;
+    }
+  }
+  if (app.settings.getBool('emporionCatalogSubscription')) {
+    final magic = await artifact
+        .openRead(0, 4)
+        .fold<List<int>>(<int>[], (bytes, chunk) => bytes..addAll(chunk));
+    final zipMagic =
+        magic.length == 4 &&
+        magic[0] == 0x50 &&
+        magic[1] == 0x4b &&
+        const {0x03, 0x05, 0x07}.contains(magic[2]) &&
+        const {0x04, 0x06, 0x08}.contains(magic[3]);
+    if (!zipMagic) {
+      await artifact.delete();
+      throw ObtainiumError(
+        'Catalog artifact is not an APK or supported ZIP container',
+      )..url = app.url;
+    }
+  }
+}
+
+class ParsedArtifactMetadata {
+  final String? packageName;
+  final int? versionCode;
+  final Set<String> currentSigners;
+  final Set<String> signingLineage;
+
+  const ParsedArtifactMetadata({
+    required this.packageName,
+    required this.versionCode,
+    required this.currentSigners,
+    required this.signingLineage,
+  });
+}
+
+void validateArtifactMetadata(
+  App app,
+  ParsedArtifactMetadata base, {
+  ParsedArtifactMetadata? installed,
+  List<ParsedArtifactMetadata> splits = const [],
+}) {
+  final baseSigners = base.currentSigners
+      .map(_normalizedCertificateDigest)
+      .toSet();
+  final incomingLineage = base.signingLineage
+      .map(_normalizedCertificateDigest)
+      .toSet();
+  if (base.packageName != app.id) {
+    throw ObtainiumError(
+      'APK package mismatch: expected ${app.id}, received ${base.packageName}',
+    )..url = app.url;
+  }
+  if (base.versionCode == null) {
+    throw ObtainiumError('APK versionCode is unavailable')..url = app.url;
+  }
+  if (app.expectedVersionCode != null &&
+      base.versionCode != app.expectedVersionCode) {
+    throw ObtainiumError(
+      'APK versionCode mismatch: expected ${app.expectedVersionCode}, received ${base.versionCode}',
+    )..url = app.url;
+  }
+  if (baseSigners.isEmpty) {
+    throw ObtainiumError('APK signing certificate is unavailable')
+      ..url = app.url;
+  }
+  final expectedSigner = app.expectedSignerSha256;
+  if (expectedSigner != null &&
+      !baseSigners.contains(_normalizedCertificateDigest(expectedSigner))) {
+    throw ObtainiumError('APK signer does not match catalog provenance')
+      ..url = app.url;
+  }
+  if (installed != null) {
+    final installedLineage = installed.signingLineage
+        .map(_normalizedCertificateDigest)
+        .toSet();
+    if (installedLineage.isEmpty ||
+        incomingLineage.isEmpty ||
+        installedLineage.intersection(incomingLineage).isEmpty) {
+      throw ObtainiumError(
+        'APK signing lineage conflicts with the installed app',
+      )..url = app.url;
+    }
+  }
+  for (final split in splits) {
+    if (split.packageName != base.packageName ||
+        split.versionCode != base.versionCode) {
+      throw ObtainiumError(
+        'Split APK package or version does not match the base APK',
+      )..url = app.url;
+    }
+    final splitSigners = split.currentSigners
+        .map(_normalizedCertificateDigest)
+        .toSet();
+    if (!_setEquals(splitSigners, baseSigners)) {
+      throw ObtainiumError('Split APK signer does not match the base APK')
+        ..url = app.url;
+    }
+  }
+}
+
+Future<void> _validateParsedArtifacts(
+  App app,
+  File baseFile,
+  PackageInfo base,
+  PackageInfo? installed,
+  List<(File, PackageInfo)> splits,
+) async {
+  final baseMetadata = ParsedArtifactMetadata(
+    packageName: base.packageName,
+    versionCode: base.versionCode,
+    currentSigners: await _archiveCurrentSigners(baseFile, base),
+    signingLineage: await _archiveSigningLineage(baseFile, base),
+  );
+  ParsedArtifactMetadata? installedMetadata;
+  if (installed != null) {
+    installedMetadata = ParsedArtifactMetadata(
+      packageName: installed.packageName,
+      versionCode: installed.versionCode,
+      currentSigners: _currentCertificateDigests(installed),
+      signingLineage: await _installedSigningLineage(app.id, installed),
+    );
+  }
+  final splitMetadata = <ParsedArtifactMetadata>[];
+  for (final split in splits) {
+    splitMetadata.add(
+      ParsedArtifactMetadata(
+        packageName: split.$2.packageName,
+        versionCode: split.$2.versionCode,
+        currentSigners: await _archiveCurrentSigners(split.$1, split.$2),
+        signingLineage: await _archiveSigningLineage(split.$1, split.$2),
+      ),
+    );
+  }
+  validateArtifactMetadata(
+    app,
+    baseMetadata,
+    installed: installedMetadata,
+    splits: splitMetadata,
+  );
+}
+
+bool _setEquals(Set<String> left, Set<String> right) =>
+    left.length == right.length && left.containsAll(right);
+const Set<String> _abiSplitTokens = {
+  'armeabi_v7a',
+  'arm64_v8a',
+  'x86',
+  'x86_64',
+};
+
+const Set<String> _densitySplitTokens = {
+  'ldpi',
+  'mdpi',
+  'hdpi',
+  'xhdpi',
+  'xxhdpi',
+  'xxxhdpi',
+};
+
+bool isLikelySplitApkName(String value) {
+  final name = value.toLowerCase();
+  return name.startsWith('split_') ||
+      name.startsWith('config.') ||
+      name.contains('split_config.');
+}
+
+bool isCompatibleSplitApkName(
+  String value, {
+  required Set<String> supportedAbis,
+  required String locale,
+  required String? density,
+}) {
+  final name = value.toLowerCase().replaceAll('-', '_');
+  final normalizedAbis = supportedAbis
+      .map((abi) => abi.toLowerCase().replaceAll('-', '_'))
+      .toSet();
+  final namedAbis = _abiSplitTokens.where(name.contains).toSet();
+  if (namedAbis.isNotEmpty && namedAbis.intersection(normalizedAbis).isEmpty) {
+    return false;
+  }
+  final namedDensities = _densitySplitTokens.where(name.contains).toSet();
+  if (density != null &&
+      namedDensities.isNotEmpty &&
+      !namedDensities.contains(density)) {
+    return false;
+  }
+  final languageMatch = RegExp(
+    r'(?:split_)?config[._]([a-z]{2,3})(?:[._]r[a-z]{2})?\.apk$',
+  ).firstMatch(name);
+  if (languageMatch != null &&
+      languageMatch.group(1) != locale.toLowerCase() &&
+      !_abiSplitTokens.contains(languageMatch.group(1)) &&
+      !_densitySplitTokens.contains(languageMatch.group(1))) {
+    return false;
+  }
+  return true;
+}
+
+List<String> safeArchivePathSegments(String value) {
+  final normalized = value.replaceAll('\\', '/');
+  final segments = normalized.split('/');
+  if (normalized.startsWith('/') ||
+      normalized.contains('\u0000') ||
+      RegExp(r'^[A-Za-z]:').hasMatch(normalized) ||
+      segments.any((segment) => segment == '..')) {
+    throw const FormatException('Unsafe archive path');
+  }
+  return segments
+      .where((segment) => segment.isNotEmpty && segment != '.')
+      .toList(growable: false);
+}
 
 class _InstallResult {
   final String id;
@@ -244,6 +556,7 @@ extension AppsProviderInstall on AppsProvider {
         notif = DownloadNotification(app.finalName, _remainingStepsProgress);
         unawaited(notificationsProvider?.notify(notif));
       }
+      await verifyDownloadedArtifact(app, downloadedFile);
       PackageInfo? newInfo;
       final originalAssetName = app.apkUrls[app.preferredApkIndex].key
           .toLowerCase();
@@ -258,6 +571,7 @@ extension AppsProviderInstall on AppsProvider {
       if (isAPK) {
         newInfo = await packageManager.getPackageArchiveInfo(
           archiveFilePath: downloadedFile.path,
+          flags: packageInfoFlags,
         );
       } else {
         final String apkDirPath = '${downloadedFile.path}-dir';
@@ -306,6 +620,7 @@ extension AppsProviderInstall on AppsProvider {
           try {
             newInfo = await packageManager.getPackageArchiveInfo(
               archiveFilePath: apks[i].path,
+              flags: packageInfoFlags,
             );
             if (newInfo != null) {
               break;
@@ -427,10 +742,49 @@ extension AppsProviderInstall on AppsProvider {
       (await getInstalledInfo('com.berdik.letmedowngrade')) != null;
 
   Future<void> unzipFile(String filePath, String destinationPath) async {
-    await ZipFile.extractToDirectory(
-      zipFile: File(filePath),
-      destinationDir: Directory(destinationPath),
-    );
+    final input = archive.InputFileStream(filePath);
+    archive.Archive? decoded;
+    try {
+      decoded = archive.ZipDecoder().decodeStream(input, verify: true);
+      var expandedBytes = 0;
+      for (final entry in decoded) {
+        late final List<String> safeSegments;
+        try {
+          safeSegments = safeArchivePathSegments(entry.name);
+        } on FormatException {
+          throw ObtainiumError(tr('invalidArchive'));
+        }
+        if (entry.isSymbolicLink) {
+          throw ObtainiumError(tr('invalidArchive'));
+        }
+        expandedBytes += entry.size;
+        if (expandedBytes > maxArtifactDownloadBytes * 2) {
+          throw ObtainiumError('Expanded archive exceeds the 4 GiB limit');
+        }
+        if (safeSegments.isEmpty) continue;
+        final outPath = [
+          destinationPath,
+          ...safeSegments,
+        ].join(Platform.pathSeparator);
+        if (entry.isDirectory) {
+          await Directory(outPath).create(recursive: true);
+          continue;
+        }
+        if (!entry.isFile) {
+          throw ObtainiumError(tr('invalidArchive'));
+        }
+        await File(outPath).parent.create(recursive: true);
+        final output = archive.OutputFileStream(outPath);
+        try {
+          entry.writeContent(output);
+        } finally {
+          await output.close();
+        }
+      }
+    } finally {
+      await input.close();
+      await decoded?.clear();
+    }
   }
 
   Future<void> extractTarballFile(
@@ -465,22 +819,99 @@ extension AppsProviderInstall on AppsProvider {
     if (!destDir.existsSync()) {
       destDir.createSync(recursive: true);
     }
-    final destRoot = Uri.file(
-      destDir.absolute.path,
-    ).normalizePath().toFilePath();
     for (final file in tarArchive.files) {
       if (!file.isFile) continue;
-      // Reject entries whose path would escape the destination directory.
-      final outPath = Uri.file(
-        '$destRoot/${file.name}',
-      ).normalizePath().toFilePath();
-      if (outPath != destRoot && !outPath.startsWith('$destRoot/')) {
+      late final List<String> safeSegments;
+      try {
+        safeSegments = safeArchivePathSegments(file.name);
+      } on FormatException {
         throw ObtainiumError(tr('invalidArchive'));
       }
+      if (safeSegments.isEmpty) continue;
+      final outPath = [
+        destDir.absolute.path,
+        ...safeSegments,
+      ].join(Platform.pathSeparator);
       final outFile = File(outPath);
       outFile.createSync(recursive: true);
       outFile.writeAsBytesSync(file.content);
     }
+  }
+
+  Future<List<File>> _validatedContainerApks(List<File> files, App app) async {
+    if (files.isEmpty) throw NoAPKError();
+    final infos = <File, PackageInfo>{};
+    for (final file in files) {
+      final info = await packageManager.getPackageArchiveInfo(
+        archiveFilePath: file.path,
+        flags: packageInfoFlags,
+      );
+      if (info == null) {
+        throw ObtainiumError(
+          'Container includes an unreadable APK: ${file.uri.pathSegments.last}',
+        )..url = app.url;
+      }
+      infos[file] = info;
+    }
+    final bases = files
+        .where((file) => !isLikelySplitApkName(file.uri.pathSegments.last))
+        .toList();
+    if (bases.length != 1) {
+      throw ObtainiumError(
+        'Container must include exactly one identifiable base APK; found ${bases.length}',
+      )..url = app.url;
+    }
+    final base = bases.single;
+    final baseInfo = infos[base]!;
+    final installed = await getInstalledInfo(app.id);
+    await _validateParsedArtifacts(
+      app,
+      base,
+      baseInfo,
+      installed,
+      files
+          .where((file) => file != base)
+          .map((file) => (file, infos[file]!))
+          .toList(),
+    );
+
+    final android = await DeviceInfoPlugin().androidInfo;
+    final supportedAbis = android.supportedAbis
+        .map((abi) => abi.toLowerCase().replaceAll('-', '_'))
+        .toSet();
+    final locale = Platform.localeName
+        .split(RegExp('[-_]'))
+        .first
+        .toLowerCase();
+    final views = WidgetsBinding.instance.platformDispatcher.views;
+    final ratio = views.isEmpty ? null : views.first.devicePixelRatio;
+    final density = ratio == null
+        ? null
+        : ratio < .75
+        ? 'ldpi'
+        : ratio < 1.25
+        ? 'mdpi'
+        : ratio < 1.75
+        ? 'hdpi'
+        : ratio < 2.5
+        ? 'xhdpi'
+        : ratio < 3.5
+        ? 'xxhdpi'
+        : 'xxxhdpi';
+
+    return [
+      base,
+      ...files.where(
+        (file) =>
+            file != base &&
+            isCompatibleSplitApkName(
+              file.uri.pathSegments.last,
+              supportedAbis: supportedAbis,
+              locale: locale,
+              density: density,
+            ),
+      ),
+    ];
   }
 
   Future<bool> installApkDir(
@@ -505,6 +936,7 @@ extension AppsProviderInstall on AppsProvider {
           await moveObbFile(file, dir.appId);
         }
       }
+      apkFiles = await _validatedContainerApks(apkFiles, apps[dir.appId]!.app);
 
       if (installer.wantsContainerHandoff) {
         // Hand off the original bundle file (XAPK/ZIP/tarball) to the
@@ -537,8 +969,6 @@ extension AppsProviderInstall on AppsProvider {
         }
         return somethingInstalled;
       }
-
-      apkFiles = _preferMatchingApk(apkFiles, dir.appId).cast<File>().toList();
 
       if (apkFiles.isEmpty) {
         throw NoAPKError();
@@ -581,11 +1011,9 @@ extension AppsProviderInstall on AppsProvider {
     Map<String, dynamic> installOptions = const {},
     List<DownloadedApk> additionalAPKs = const [],
   }) async {
-    if (firstTimeWithContext != null) {
-      await _shareWithVerifiedApps(file, firstTimeWithContext);
-    }
     final newInfo = await packageManager.getPackageArchiveInfo(
       archiveFilePath: file.file.path,
+      flags: packageInfoFlags,
     );
     if (newInfo == null) {
       try {
@@ -603,6 +1031,34 @@ extension AppsProviderInstall on AppsProvider {
     final PackageInfo? appInfo = await getInstalledInfo(
       apps[file.appId]!.app.id,
     );
+    final splitInfos = <(File, PackageInfo)>[];
+    try {
+      for (final split in additionalAPKs) {
+        final splitInfo = await packageManager.getPackageArchiveInfo(
+          archiveFilePath: split.file.path,
+          flags: packageInfoFlags,
+        );
+        if (splitInfo == null) {
+          throw ObtainiumError('A split APK could not be parsed')
+            ..url = apps[file.appId]!.app.url;
+        }
+        splitInfos.add((split.file, splitInfo));
+      }
+      await _validateParsedArtifacts(
+        apps[file.appId]!.app,
+        file.file,
+        newInfo,
+        appInfo,
+        splitInfos,
+      );
+    } catch (_) {
+      for (final artifact in [file, ...additionalAPKs]) {
+        if (artifact.file.existsSync()) {
+          await artifact.file.delete();
+        }
+      }
+      rethrow;
+    }
     AppLogger.info(
       'Installing "${newInfo.packageName}" version "${newInfo.versionName}" versionCode "${newInfo.versionCode}"${appInfo != null ? ' (from existing version "${appInfo.versionName}" versionCode "${appInfo.versionCode}")' : ''}',
     );
@@ -611,16 +1067,29 @@ extension AppsProviderInstall on AppsProvider {
     if (appInfo != null &&
         newVersionCode != null &&
         oldVersionCode != null &&
-        newVersionCode < oldVersionCode &&
-        !(await canDowngradeApps())) {
-      if (settingsProvider.showAppDowngradeError) {
-        try {
-          file.file.deleteSync();
-        } catch (e) {
-          AppLogger.error(e, message: 'Failed to delete downgraded APK file');
-        }
-        throw DowngradeError(oldVersionCode, newVersionCode);
+        newVersionCode < oldVersionCode) {
+      if (file.file.existsSync()) {
+        await file.file.delete();
       }
+      throw DowngradeError(oldVersionCode, newVersionCode);
+    }
+    final isSelfUpdate =
+        file.appId == obtainiumId ||
+        file.appId == '$obtainiumId.fdroid' ||
+        file.appId == '$obtainiumId.debug';
+    if (isSelfUpdate &&
+        appInfo != null &&
+        newVersionCode != null &&
+        oldVersionCode != null &&
+        newVersionCode <= oldVersionCode) {
+      if (file.file.existsSync()) {
+        await file.file.delete();
+      }
+      throw ObtainiumError('Emporion self-update must increase versionCode')
+        ..url = apps[file.appId]!.app.url;
+    }
+    if (firstTimeWithContext != null && firstTimeWithContext.mounted) {
+      await _shareWithVerifiedApps(file, firstTimeWithContext);
     }
     if (needsBGWorkaround) {
       // Background process workaround (#896): the `await installApk` below
@@ -635,19 +1104,24 @@ extension AppsProviderInstall on AppsProvider {
     }
     final allAPKs = [file.file.path];
     allAPKs.addAll(additionalAPKs.map((a) => a.file.path));
+    final verifiedInstallOptions = <String, dynamic>{
+      ...installOptions,
+      'expectedVersionCode': newVersionCode,
+      'selfUpdate': isSelfUpdate,
+    };
     final installer = getInstaller();
     final InstallResult result =
         needsBGWorkaround || installer.modeKey != 'stock'
         ? await installer.installApk(
             allAPKs,
             appId: file.appId,
-            installOptions: installOptions,
+            installOptions: verifiedInstallOptions,
           )
         : await _installWithPollConfirmation(
             installer,
             allAPKs,
             file.appId,
-            installOptions,
+            verifiedInstallOptions,
           );
     bool installed = false;
     if (result.isError) {

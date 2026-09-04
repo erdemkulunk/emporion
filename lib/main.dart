@@ -1,9 +1,24 @@
 import 'dart:async';
 import 'dart:ui' show Locale, PlatformDispatcher;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:intl/date_symbol_data_local.dart';
+import 'package:obtainium/catalog/accounts/account_service.dart';
+import 'package:obtainium/catalog/accounts/credential_store.dart';
+import 'package:obtainium/catalog/adapters/forgejo_catalog_adapter.dart';
+import 'package:obtainium/catalog/adapters/github_catalog_adapter.dart';
+import 'package:obtainium/catalog/adapters/gitlab_catalog_adapter.dart';
+import 'package:obtainium/catalog/catalog_provider.dart';
+import 'package:obtainium/catalog/background_refresh.dart';
+import 'package:obtainium/catalog/data/catalog_database.dart';
+import 'package:obtainium/catalog/data/catalog_repository.dart';
+import 'package:obtainium/catalog/fdroid/fdroid_repository_service.dart';
+import 'package:obtainium/catalog/fdroid/verified_fdroid_catalog_source.dart';
+import 'package:obtainium/catalog/models.dart';
+import 'package:obtainium/catalog/network/provider_http_client.dart';
 import 'package:obtainium/custom_errors.dart';
 import 'package:obtainium/providers/apps_provider.dart';
 import 'package:obtainium/core/logging/app_logger.dart';
@@ -67,6 +82,56 @@ final appNavigatorKey = GlobalKey<NavigatorState>();
 
 /// Unique task name used by WorkManager for periodic background update checks.
 const _workManagerTaskName = 'obtainiumBgUpdateCheck';
+const _catalogRefreshTaskName = 'emporionCatalogRefresh';
+const _catalogManualRefreshTaskName = 'emporionCatalogRefreshManual';
+
+Future<void> _runCatalogRefreshTask() async {
+  final settings = SettingsProvider();
+  await settings.initializeSettings();
+  final database = CatalogDatabase();
+  final apps = AppsProvider(
+    isBg: true,
+    settingsProvider: settings,
+    catalogDatabase: database,
+  );
+  await apps.ready;
+  const credentials = CredentialStore();
+  final transport = ProviderHttpClient(
+    credentialReader: credentials,
+    maxRequestsPerQueue: 200,
+  );
+  final repository = CatalogRepository(
+    database: database,
+    adapters: [
+      GitHubCatalogAdapter(transport),
+      GitLabCatalogAdapter(transport),
+      ForgejoCatalogAdapter(transport),
+    ],
+  );
+  final fdroid = VerifiedFdroidCatalogSource(database: database);
+  final report = await CatalogBackgroundRefresher(
+    repository: repository,
+    fdroid: fdroid,
+  ).run(subscribedUrls: apps.apps.values.map((entry) => entry.app.url).toSet());
+  for (final error in report.errors) {
+    AppLogger.warn('Catalog refresh: $error');
+  }
+  if (report.hasActionableError) {
+    final notifications = NotificationsProvider();
+    await notifications.initialize();
+    await notifications.notifyRaw(
+      73001,
+      'Emporion catalog needs attention',
+      'Open provider accounts or F-Droid repositories to resolve a trust or authentication error.',
+      'catalogAttention',
+      'Catalog attention',
+      'Authentication and repository trust problems',
+      Importance.defaultImportance,
+      cancelExisting: true,
+      payload: 'emporion://settings',
+    );
+  }
+}
 
 @pragma('vm:entry-point')
 void callbackDispatcher() {
@@ -75,8 +140,13 @@ void callbackDispatcher() {
     await AppLogger.init();
     try {
       AppLogger.info('WorkManager callback invoked (task: $taskName)');
-      final taskId = 'wm_${DateTime.now().millisecondsSinceEpoch}';
-      await bgUpdateCheck(taskId, inputData);
+      if (taskName == _catalogRefreshTaskName ||
+          taskName == _catalogManualRefreshTaskName) {
+        await _runCatalogRefreshTask();
+      } else {
+        final taskId = 'wm_${DateTime.now().millisecondsSinceEpoch}';
+        await bgUpdateCheck(taskId, inputData);
+      }
       AppLogger.info('WorkManager callback completed successfully');
       return true;
     } catch (e, stack) {
@@ -117,7 +187,42 @@ void main() async {
 
   final settingsProvider = SettingsProvider();
   final sourceProvider = SourceProvider();
-  final appsProvider = AppsProvider(settingsProvider: settingsProvider);
+  final catalogDatabase = CatalogDatabase();
+  final appsProvider = AppsProvider(
+    settingsProvider: settingsProvider,
+    catalogDatabase: catalogDatabase,
+  );
+  const credentialStore = CredentialStore();
+  final providerHttpClient = ProviderHttpClient(
+    credentialReader: credentialStore,
+  );
+  final catalogRepository = CatalogRepository(
+    database: catalogDatabase,
+    adapters: [
+      GitHubCatalogAdapter(providerHttpClient),
+      GitLabCatalogAdapter(providerHttpClient),
+      ForgejoCatalogAdapter(providerHttpClient),
+    ],
+  );
+  final catalogProvider = CatalogProvider(
+    repository: catalogRepository,
+    onPreferencesChanged: appsProvider.scheduleAutoExport,
+  );
+  appsProvider.catalogProvider = catalogProvider;
+  final accountService = AccountService(
+    catalog: catalogRepository,
+    credentials: credentialStore,
+    apps: appsProvider,
+    settings: settingsProvider,
+  );
+  final verifiedFdroidSource = VerifiedFdroidCatalogSource(
+    database: catalogRepository.database,
+  );
+  final fdroidRepositoryService = FdroidRepositoryService(
+    database: catalogRepository.database,
+    source: verifiedFdroidSource,
+    onConfigurationChanged: appsProvider.scheduleAutoExport,
+  );
   final np = NotificationsProvider();
   await np.initialize();
 
@@ -171,6 +276,13 @@ void main() async {
         ChangeNotifierProvider.value(value: settingsProvider),
         Provider.value(value: np),
         Provider<SourceProvider>.value(value: sourceProvider),
+        ChangeNotifierProvider.value(value: catalogProvider),
+        Provider<CredentialStore>.value(value: credentialStore),
+        Provider<VerifiedFdroidCatalogSource>.value(
+          value: verifiedFdroidSource,
+        ),
+        Provider<FdroidRepositoryService>.value(value: fdroidRepositoryService),
+        Provider<AccountService>.value(value: accountService),
       ],
       child: EasyLocalization(
         supportedLocales: supportedLocales.map((e) => e.key).toList(),
@@ -209,6 +321,57 @@ class _ObtainiumState extends State<Obtainium> {
       ),
       existingWorkPolicy: ExistingPeriodicWorkPolicy.keep,
     );
+    await Workmanager().registerPeriodicTask(
+      _catalogRefreshTaskName,
+      _catalogRefreshTaskName,
+      frequency: const Duration(hours: 12),
+      flexInterval: const Duration(hours: 2),
+      constraints: Constraints(
+        networkType: NetworkType.connected,
+        requiresBatteryNotLow: true,
+        requiresStorageNotLow: true,
+      ),
+      existingWorkPolicy: ExistingPeriodicWorkPolicy.keep,
+    );
+  }
+
+  Future<void> _reconcilePendingInstall(
+    SettingsProvider settings,
+    AppsProvider apps,
+    NotificationsProvider notifications,
+  ) async {
+    final pending = settings.pendingInstall;
+    if (pending == null) return;
+    final appId = pending['appId'] as String?;
+    if (appId == null || appId.isEmpty) {
+      await settings.clearPendingInstall();
+      return;
+    }
+    final expectedVersionCode = pending['expectedVersionCode'] as int?;
+    final installed = await getInstalledInfo(appId);
+    if (installed != null &&
+        expectedVersionCode != null &&
+        (installed.versionCode ?? -1) >= expectedVersionCode) {
+      await settings.clearPendingInstall();
+      AppLogger.info('Reconciled completed pending install for $appId');
+      return;
+    }
+    final name = apps.apps[appId]?.app.finalName ?? appId;
+    await notifications.notify(
+      ObtainiumNotification(
+        9011,
+        'Complete installation',
+        '$name still has a user-confirmed install pending. Open Emporion to review and retry it.',
+        'PENDING_INSTALL',
+        'Pending installations',
+        'Install work that still requires user confirmation',
+        Importance.max,
+        payload: apps.apps.containsKey(appId)
+            ? '$appIdTapPayloadPrefix$appId'
+            : 'Complete installation\\nOpen Library and retry $name.',
+      ),
+      cancelExisting: true,
+    );
   }
 
   void _handleFirstRun(
@@ -218,13 +381,20 @@ class _ObtainiumState extends State<Obtainium> {
   ) {
     if (_firstRunHandled) return;
     _firstRunHandled = true;
+    unawaited(
+      _reconcilePendingInstall(
+        settings,
+        apps,
+        context.read<NotificationsProvider>(),
+      ),
+    );
     final isFirstRun = settings.checkAndFlipFirstRun();
     if (isFirstRun) {
-      AppLogger.info('This is the first ever run of Obtainium.');
+      AppLogger.info('This is the first ever run of Emporion.');
       if (!settings.isTV) {
         unawaited(Permission.notification.request());
       }
-      if (!isFdroidBuild) {
+      if (!isFdroidBuild && !kDebugMode) {
         getInstalledInfo(obtainiumId)
             .then((value) {
               if (value?.versionName != null) {
@@ -233,16 +403,17 @@ class _ObtainiumState extends State<Obtainium> {
                     App(
                       id: obtainiumId,
                       url: obtainiumUrl,
-                      author: 'ImranR98',
-                      name: 'Obtainium',
+                      author: 'erdemkulunk',
+                      name: 'Emporion',
                       installedVersion: value!.versionName,
                       latestVersion: value.versionName!,
                       apkUrls: [],
                       preferredApkIndex: 0,
                       additionalSettings: {
                         'versionDetection': true,
-                        'apkFilterRegEx': 'fdroid',
-                        'invertAPKFilter': true,
+                        'apkFilterRegEx': obtainiumAssetRegex,
+                        'emporionSelfUpdate': true,
+                        'includePrereleases': true,
                       },
                       lastUpdateCheck: null,
                       pinned: false,
@@ -255,7 +426,7 @@ class _ObtainiumState extends State<Obtainium> {
               AppLogger.error(
                 err,
                 stackTrace: stack,
-                message: 'Failed to add Obtainium on first run',
+                message: 'Failed to add Emporion on first run',
               );
             });
       }
@@ -275,10 +446,23 @@ class _ObtainiumState extends State<Obtainium> {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       final settingsProvider = context.read<SettingsProvider>();
-      await settingsProvider.initializeSettings();
-      if (!mounted) return;
+      final catalogProvider = context.read<CatalogProvider>();
       final appsProvider = context.read<AppsProvider>();
+      final accountService = context.read<AccountService>();
       final notifs = context.read<NotificationsProvider>();
+      await settingsProvider.initializeSettings();
+      await catalogProvider.initialize();
+      await appsProvider.ready;
+      final migration = await accountService.migrateLegacyCredentials();
+      for (final entry in migration.entries) {
+        if (entry.value is! ProviderAccount) {
+          AppLogger.warn(
+            'Legacy credential migration failed for ${entry.key}: ${entry.value}',
+          );
+        }
+      }
+      await catalogProvider.reloadConfiguration();
+      if (!mounted) return;
 
       unawaited(_scheduleWorkManager());
       _handleFirstRun(settingsProvider, appsProvider, context);
@@ -346,7 +530,7 @@ class _ObtainiumState extends State<Obtainium> {
         }
 
         return MaterialApp(
-          title: 'Obtainium',
+          title: 'Emporion',
           navigatorKey: appNavigatorKey,
           localizationsDelegates: context.localizationDelegates,
           supportedLocales: context.supportedLocales,

@@ -749,7 +749,7 @@ class AppsPageState extends State<AppsPage> {
     final urls = buf.toString().trimRight();
     unawaited(
       SharePlus.instance.share(
-        ShareParams(text: urls, subject: 'Obtainium - ${tr('appsString')}'),
+        ShareParams(text: urls, subject: 'Emporion - ${tr('appsString')}'),
       ),
     );
   }
@@ -758,23 +758,23 @@ class AppsPageState extends State<AppsPage> {
     final buf = StringBuffer();
     for (var a in selectedApps) {
       buf.writeln(
-        'https://apps.obtainium.imranr.dev/redirect?r=obtainium://app/${Uri.encodeComponent(jsonEncode({'id': a.id, 'url': a.url, 'author': a.author, 'name': a.name, 'preferredApkIndex': a.preferredApkIndex, 'additionalSettings': jsonEncode(a.additionalSettings), 'overrideSource': a.overrideSource}))}',
+        'emporion://app/${Uri.encodeComponent(jsonEncode({'id': a.id, 'url': a.url, 'author': a.author, 'name': a.name, 'preferredApkIndex': a.preferredApkIndex, 'additionalSettings': jsonEncode(a.additionalSettings), 'overrideSource': a.overrideSource}))}',
       );
     }
     unawaited(
       SharePlus.instance.share(
         ShareParams(
           text: buf.toString(),
-          subject: 'Obtainium - ${tr('appsString')}',
+          subject: 'Emporion - ${tr('appsString')}',
         ),
       ),
     );
   }
 
-  void shareExport(Set<App> selectedApps) {
+  Future<void> shareExport(Set<App> selectedApps) async {
     const encoder = JsonEncoder.withIndent('    ');
     final exportJSON = encoder.convert(
-      appsProvider.generateExportJSON(
+      await appsProvider.generateExportJSON(
         appIds: selectedApps.map((e) => e.id).toList(),
         overrideExportSettings: 0,
       ),
@@ -786,10 +786,8 @@ class AppsPageState extends State<AppsPage> {
       mimeType: 'application/json',
       name: fn,
     );
-    unawaited(
-      SharePlus.instance.share(
-        ShareParams(files: [f], fileNameOverrides: ['$fn.json']),
-      ),
+    await SharePlus.instance.share(
+      ShareParams(files: [f], fileNameOverrides: ['$fn.json']),
     );
   }
 
@@ -1232,6 +1230,19 @@ class AppsPageState extends State<AppsPage> {
                       ),
                     ],
                   ),
+                  if (isFdroidBuild)
+                    const SliverToBoxAdapter(
+                      child: Card(
+                        margin: EdgeInsets.fromLTRB(16, 8, 16, 4),
+                        child: ListTile(
+                          leading: Icon(Icons.info_outline),
+                          title: Text('Emporion self-update is disabled'),
+                          subtitle: Text(
+                            'This separately signed F-Droid flavor will track only dev.erdem.emporion.fdroid from a trusted F-Droid repository once it is published. It never installs the GitHub normal APK.',
+                          ),
+                        ),
+                      ),
+                    ),
                   if (appsProvider.apps.isNotEmpty)
                     _getSearchBarSliver(context, settingsProvider, listedApps),
                   if (appsProvider.apps.isNotEmpty)
@@ -1286,8 +1297,11 @@ class AppsPageState extends State<AppsPage> {
     );
   }
 
-  void openAppById(String appId) {
-    final AppInMemory? app = context.read<AppsProvider>().apps[appId];
+  Future<void> openAppById(String appId) async {
+    final provider = context.read<AppsProvider>();
+    await provider.loadApps(singleId: appId);
+    if (!mounted) return;
+    final AppInMemory? app = provider.apps[appId];
 
     if (app == null) {
       return;

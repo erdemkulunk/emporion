@@ -4,11 +4,16 @@ import 'dart:convert';
 import 'package:app_links/app_links.dart';
 import 'package:easy_localization/easy_localization.dart';
 import 'package:flutter/material.dart';
+import 'package:obtainium/app_sources/fdroid.dart';
+import 'package:obtainium/app_sources/fdroidrepo.dart';
+import 'package:obtainium/catalog/catalog_provider.dart';
+import 'package:obtainium/catalog/models.dart';
 import 'package:obtainium/components/generated_form_renderer.dart';
 import 'package:obtainium/components/ui_widgets.dart';
 import 'package:obtainium/custom_errors.dart';
 import 'package:obtainium/pages/app.dart';
 import 'package:obtainium/pages/apps.dart';
+import 'package:obtainium/pages/explore.dart';
 import 'package:obtainium/providers/apps_provider.dart';
 import 'package:obtainium/core/logging/app_logger.dart';
 import 'package:obtainium/providers/settings_provider.dart';
@@ -36,6 +41,7 @@ class _HomePageState extends State<HomePage> {
   final GlobalKey<AppsPageState> appsPageKey = GlobalKey<AppsPageState>();
   String? selectedAppId;
   bool appsSelecting = false;
+  int destinationIndex = 0;
 
   @override
   void didChangeDependencies() {
@@ -60,6 +66,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   void selectApp(String appId) {
+    destinationIndex = 1;
     selectedAppId = appId;
     setState(() {});
   }
@@ -110,9 +117,9 @@ class _HomePageState extends State<HomePage> {
                 Text(tr('documentationLinksNote')),
                 const LinkText(
                   text:
-                      'https://github.com/ImranR98/Obtainium/blob/main/README.md',
+                      'https://github.com/erdemkulunk/emporion/blob/main/README.md',
                   url:
-                      'https://github.com/ImranR98/Obtainium/blob/main/README.md',
+                      'https://github.com/erdemkulunk/emporion/blob/main/README.md',
                   style: TextStyle(fontWeight: FontWeight.bold),
                 ),
               ],
@@ -176,12 +183,14 @@ class _HomePageState extends State<HomePage> {
     }
 
     Future<void> goToExistingApp(String appId) async {
+      if (!mounted) return;
+      setState(() => destinationIndex = 1);
       await waitUntil(
         () => appsPageKey.currentState != null,
         interval: const Duration(milliseconds: 100),
         maxAttempts: 50,
       );
-      appsPageKey.currentState?.openAppById(appId);
+      await appsPageKey.currentState?.openAppById(appId);
     }
 
     Future<void> interpretLink(Uri uri) async {
@@ -313,6 +322,196 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
+  Future<void> subscribeFromCatalog(CatalogEntry entry, bool install) async {
+    final origin = await _chooseInstallOrigin(entry);
+    if (origin == null) {
+      throw ObtainiumError('Install source selection was cancelled');
+    }
+    if (!mounted) {
+      throw ObtainiumError('The catalog page is no longer active');
+    }
+    final settings = <String, dynamic>{
+      'emporionCatalogSubscription': true,
+      'includePrereleases': false,
+      'releaseChannel': 'stable',
+    };
+    late final AppSource source;
+    late final String url;
+    var sourceIsOverridden = false;
+
+    if (origin.kind == CatalogOriginKind.fdroidPackage) {
+      final package = entry.fdroidPackage;
+      if (package == null) {
+        throw ObtainiumError(
+          'Verified F-Droid package metadata is unavailable',
+        );
+      }
+      final repository = context
+          .read<CatalogProvider>()
+          .fdroidRepositories
+          .where((repo) => repo.id == package.repositoryId)
+          .firstOrNull;
+      if (repository == null ||
+          !repository.enabled ||
+          repository.trustState != RepositoryTrustState.trusted) {
+        throw ObtainiumError('The selected F-Droid repository is not trusted');
+      }
+      settings
+        ..['appId'] = package.packageName
+        ..['appIdOrName'] = package.packageName
+        ..['fdroidSignerSha256'] = package.signerSha256
+        ..['trySelectingSuggestedVersionCode'] = true;
+      if (repository.canonicalUrl == FDroid.repositoryUrl) {
+        source = FDroid();
+        url = 'https://f-droid.org/packages/${package.packageName}';
+      } else {
+        source = FDroidRepo();
+        url =
+            '${repository.canonicalUrl}?appId=${Uri.encodeQueryComponent(package.packageName)}';
+        sourceIsOverridden = true;
+      }
+    } else {
+      final repository = entry.forgeRepository;
+      if (repository == null) {
+        throw ObtainiumError('Forge repository metadata is unavailable');
+      }
+      url = repository.webUrl.toString();
+      final overrideSource = switch (repository.provider) {
+        ProviderKind.github when repository.host != 'github.com' => 'GitHub',
+        ProviderKind.gitlab when repository.host != 'gitlab.com' => 'GitLab',
+        ProviderKind.forgejo => 'Codeberg',
+        _ => null,
+      };
+      source = sourceProvider.getSource(url, overrideSource: overrideSource);
+      sourceIsOverridden = overrideSource != null;
+      if (origin.accountId != null) {
+        settings
+          ..['accountId'] = origin.accountId
+          ..['accountHost'] = repository.host
+          ..['accountProvider'] = repository.provider.name;
+      }
+      final installableAssets = entry.installOrigins
+          .where((origin) => origin.kind == CatalogOriginKind.forgeRelease)
+          .toList();
+      if (installableAssets.length > 1) {
+        settings['apkFilterRegEx'] = '^${RegExp.escape(origin.label)}\$';
+      }
+    }
+
+    var app = await sourceProvider.getApp(
+      source,
+      url,
+      settings,
+      sourceIsOverriden: sourceIsOverridden,
+      inferAppIdIfOptional: origin.expectedPackageName != null,
+    );
+    app = app.copyWith(
+      expectedSha256: app.expectedSha256 ?? origin.expectedSha256,
+      expectedSize: app.expectedSize ?? origin.expectedSize,
+      expectedSignerSha256:
+          app.expectedSignerSha256 ?? origin.expectedSignerSha256,
+      accountId: app.accountId ?? origin.accountId,
+      expectedVersionCode:
+          app.expectedVersionCode ?? origin.expectedVersionCode,
+    );
+    final duplicate = appsProvider.apps.values
+        .where(
+          (existing) =>
+              existing.app.id == app.id || existing.app.url == app.url,
+        )
+        .firstOrNull;
+    if (duplicate != null) {
+      throw ObtainiumError(
+        'Already subscribed: ${duplicate.app.name} (${duplicate.app.id})',
+      );
+    }
+    await appsProvider.saveApps([app], onlyIfExists: false);
+    if (install && !mounted) {
+      throw ObtainiumError('The catalog page is no longer active');
+    }
+    if (install) {
+      await appsProvider.downloadAndInstallLatestApps([app.id], context);
+    }
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            install
+                ? '${app.name} was subscribed and sent to the installer'
+                : '${app.name} was added to Library',
+          ),
+        ),
+      );
+    }
+  }
+
+  Future<InstallOrigin?> _chooseInstallOrigin(CatalogEntry entry) async {
+    final origins = entry.installOrigins;
+    if (origins.isEmpty) {
+      throw ObtainiumError('No compatible APK source is available');
+    }
+    final installed = entry.packageName == null
+        ? null
+        : appsProvider.apps[entry.packageName!];
+    final installedLineage =
+        installed?.certificateHashes
+            .map((digest) => digest.replaceAll(':', '').toUpperCase())
+            .toSet() ??
+        const <String>{};
+    final lineageMatches = origins
+        .where(
+          (origin) =>
+              origin.expectedSignerSha256 != null &&
+              installedLineage.contains(
+                origin.expectedSignerSha256!.replaceAll(':', '').toUpperCase(),
+              ),
+        )
+        .toList();
+    if (lineageMatches.length == 1) return lineageMatches.single;
+    if (origins.length == 1 &&
+        origins.single.trusted &&
+        origins.single.compatibility != AvailabilityState.unavailable &&
+        entry.deviceCompatibility != AvailabilityState.unavailable) {
+      return origins.single;
+    }
+    if (!mounted) return null;
+    return showDialog<InstallOrigin>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: const Text('Choose install origin'),
+        children: origins
+            .map(
+              (origin) => SimpleDialogOption(
+                onPressed: () => Navigator.pop(dialogContext, origin),
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(
+                    origin.trusted
+                        ? Icons.verified_user_outlined
+                        : Icons.warning_amber_outlined,
+                  ),
+                  title: Text(origin.label),
+                  subtitle: Text(
+                    [
+                      origin.sourceUrl.host,
+                      origin.trusted
+                          ? 'Cryptographically verified repository'
+                          : 'Provider metadata; APK identity verified before install',
+                      'Compatibility: ${origin.compatibility.name}',
+                      if (origin.expectedSha256 != null)
+                        'SHA-256 ${origin.expectedSha256}',
+                      if (origin.expectedSignerSha256 != null)
+                        'Signer ${origin.expectedSignerSha256}',
+                    ].join('\n'),
+                  ),
+                ),
+              ),
+            )
+            .toList(),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final settingsProvider = context.watch<SettingsProvider>();
@@ -379,11 +578,17 @@ class _HomePageState extends State<HomePage> {
         ? actionsFab
         : (loadingApps ? null : createFabExtended);
 
-    final Widget content;
-    if (useTwoPane) {
+    final showingLibrary = destinationIndex == 1;
+    final Widget destinationContent;
+    if (!showingLibrary) {
+      destinationContent = ExplorePage(
+        onOpenSettings: pushSettings,
+        onSubscribe: subscribeFromCatalog,
+      );
+    } else if (useTwoPane) {
       // Host the FAB in a nested Scaffold around the first pane so it aligns
       // with the app list instead of floating over the detail pane.
-      content = Row(
+      destinationContent = Row(
         children: [
           Expanded(
             flex: 2,
@@ -398,19 +603,46 @@ class _HomePageState extends State<HomePage> {
         ],
       );
     } else {
-      content = appsPage;
+      destinationContent = appsPage;
     }
+
+    final content = useLargeScreen
+        ? Row(
+            children: [
+              NavigationRail(
+                selectedIndex: destinationIndex,
+                onDestinationSelected: (index) =>
+                    setState(() => destinationIndex = index),
+                labelType: NavigationRailLabelType.all,
+                destinations: const [
+                  NavigationRailDestination(
+                    icon: Icon(Icons.explore_outlined),
+                    selectedIcon: Icon(Icons.explore),
+                    label: Text('Explore'),
+                  ),
+                  NavigationRailDestination(
+                    icon: Icon(Icons.apps_outlined),
+                    selectedIcon: Icon(Icons.apps),
+                    label: Text('Library'),
+                  ),
+                ],
+              ),
+              const VerticalDivider(width: 1),
+              Expanded(child: destinationContent),
+            ],
+          )
+        : destinationContent;
 
     return PopScope(
       canPop: true,
       onPopInvokedWithResult: (didPop, result) {
-        if (!didPop && selectedAppId != null) {
+        if (!didPop && showingLibrary && selectedAppId != null) {
           clearSelectedApp();
         }
       },
       child: Scaffold(
         backgroundColor: Theme.of(context).colorScheme.surface,
-        body: useTwoPane
+        body: useTwoPane || !showingLibrary
             ? content
             : Align(
                 alignment: Alignment.topCenter,
@@ -419,7 +651,26 @@ class _HomePageState extends State<HomePage> {
                   child: content,
                 ),
               ),
-        floatingActionButton: useTwoPane ? null : fab,
+        bottomNavigationBar: useLargeScreen
+            ? null
+            : NavigationBar(
+                selectedIndex: destinationIndex,
+                onDestinationSelected: (index) =>
+                    setState(() => destinationIndex = index),
+                destinations: const [
+                  NavigationDestination(
+                    icon: Icon(Icons.explore_outlined),
+                    selectedIcon: Icon(Icons.explore),
+                    label: 'Explore',
+                  ),
+                  NavigationDestination(
+                    icon: Icon(Icons.apps_outlined),
+                    selectedIcon: Icon(Icons.apps),
+                    label: 'Library',
+                  ),
+                ],
+              ),
+        floatingActionButton: showingLibrary && !useTwoPane ? fab : null,
       ),
     );
   }

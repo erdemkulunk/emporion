@@ -15,33 +15,6 @@ import 'package:obtainium/providers/source_provider.dart';
 import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
 
-/// Shows a blocking dialog warning that an "include all settings" export
-/// embeds potentially sensitive values in cleartext.
-/// Returns true if the user chooses to export anyway.
-Future<bool> confirmExportIncludesSecrets(BuildContext context) async {
-  final proceed = await showDialog<bool>(
-    context: context,
-    builder: (BuildContext ctx) {
-      return AlertDialog(
-        title: Text(tr('warning')),
-        content: Text(tr('exportIncludesSecretsWarning')),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(false),
-            child: Text(tr('cancel')),
-          ),
-          FilledButton.tonal(
-            autofocus: true,
-            onPressed: () => Navigator.of(ctx).pop(true),
-            child: Text(tr('continue')),
-          ),
-        ],
-      );
-    },
-  );
-  return proceed == true;
-}
-
 class ImportFromURLListPage extends StatefulWidget {
   const ImportFromURLListPage({super.key});
 
@@ -248,7 +221,38 @@ class _ImportSectionState extends State<ImportSection> {
             } catch (e) {
               throw ObtainiumError(tr('invalidInput'));
             }
-            final value = await appsProvider.import(data);
+            final plan = appsProvider.prepareImport(data);
+            var overwriteConflicts = false;
+            if (plan.conflictingAppIds.isNotEmpty) {
+              if (!context.mounted) return;
+              final decision = await showDialog<bool>(
+                context: context,
+                barrierDismissible: false,
+                builder: (dialogContext) => AlertDialog(
+                  title: const Text('Resolve subscription conflicts'),
+                  content: Text(
+                    '${plan.conflictingAppIds.length} existing subscription'
+                    '${plan.conflictingAppIds.length == 1 ? '' : 's'} differ from this backup. '
+                    'Keep the current configuration or replace it with the backup version.',
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(dialogContext, false),
+                      child: const Text('Keep existing'),
+                    ),
+                    FilledButton(
+                      onPressed: () => Navigator.pop(dialogContext, true),
+                      child: const Text('Use backup'),
+                    ),
+                  ],
+                ),
+              );
+              overwriteConflicts = decision ?? false;
+            }
+            final value = await appsProvider.applyImport(
+              plan,
+              overwriteConflicts: overwriteConflicts,
+            );
             appsProvider.addMissingCategories(settingsProvider);
             if (!context.mounted) return;
             showMessage(
@@ -417,10 +421,6 @@ class _ExportSectionState extends State<ExportSection> {
 
     Future<void> runObtainiumExport({bool pickOnly = false}) async {
       settingsProvider.selectionClick();
-      if (!pickOnly && settingsProvider.exportSettings >= 2) {
-        final proceed = await confirmExportIncludesSecrets(context);
-        if (!proceed) return;
-      }
       unawaited(
         appsProvider
             .export(
@@ -517,7 +517,6 @@ class _ExportSectionState extends State<ExportSection> {
                 dropdownMenuEntries: [
                   DropdownMenuEntry(value: '0', label: tr('none')),
                   DropdownMenuEntry(value: '1', label: tr('excludeSecrets')),
-                  DropdownMenuEntry(value: '2', label: tr('all')),
                 ],
                 onSelected: (value) {
                   if (value != null) {

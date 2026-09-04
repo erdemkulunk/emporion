@@ -2,9 +2,10 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:http/http.dart';
+import 'package:obtainium/catalog/accounts/credential_store.dart';
+import 'package:obtainium/catalog/models.dart';
 import 'package:obtainium/app_sources/github.dart';
 import 'package:obtainium/custom_errors.dart';
-import 'package:obtainium/providers/settings_provider.dart';
 import 'package:obtainium/providers/source_provider.dart';
 import 'package:obtainium/components/generated_form_model.dart';
 import 'package:easy_localization/easy_localization.dart';
@@ -23,16 +24,7 @@ class GitLab extends AppSource {
   }
 
   @override
-  List<GeneratedFormItem> get sourceConfigSettingFormItems => [
-    GeneratedFormTextField(
-      'gitlab-creds',
-      label: tr('gitlabPATLabel'),
-      password: true,
-      required: false,
-      helpUrl:
-          'https://docs.gitlab.com/ee/user/profile/personal_access_tokens.html#create-a-personal-access-token',
-    ),
-  ];
+  List<GeneratedFormItem> get sourceConfigSettingFormItems => [];
 
   @override
   List<List<GeneratedFormItem>>
@@ -58,15 +50,19 @@ class GitLab extends AppSource {
     return match.group(0)!;
   }
 
-  Future<String?> getPATIfAny(Map<String, dynamic> additionalSettings) async {
-    final SettingsProvider settingsProvider = SettingsProvider();
-    await settingsProvider.initializeSettings();
-    final sourceConfig = await getSourceConfigValues(
-      additionalSettings,
-      settingsProvider,
+  Future<String?> getPATIfAny(
+    Map<String, dynamic> additionalSettings, {
+    required String url,
+  }) async {
+    final accountId = additionalSettings['accountId'] as String?;
+    if (accountId == null || accountId.isEmpty) return null;
+    final accountHost =
+        additionalSettings['accountHost'] as String? ?? Uri.parse(url).host;
+    return const CredentialStore().getByIdentity(
+      accountId: accountId,
+      provider: ProviderKind.gitlab,
+      host: accountHost,
     );
-    final String? creds = sourceConfig['gitlab-creds'];
-    return creds != null && creds.isNotEmpty ? creds : null;
   }
 
   @override
@@ -101,9 +97,13 @@ class GitLab extends AppSource {
     String url, {
     bool forAPKDownload = false,
   }) async {
-    // Provide headers acceptable to, e.g. Cloudflare protection
-    final headers = <String, String>{};
-    headers[HttpHeaders.refererHeader] = 'https://${hosts[0]}';
+    final headers = <String, String>{
+      HttpHeaders.refererHeader: 'https://${hosts[0]}',
+    };
+    final pat = await getPATIfAny(additionalSettings, url: url);
+    if (pat != null && pat.isNotEmpty) {
+      headers['PRIVATE-TOKEN'] = pat;
+    }
     return headers;
   }
 
@@ -112,15 +112,7 @@ class GitLab extends AppSource {
     String assetUrl,
     String standardUrl,
     Map<String, dynamic> additionalSettings,
-  ) async {
-    final String? pat = await getPATIfAny(
-      hostChanged ? additionalSettings : {},
-    );
-    final String optionalAuth = (pat != null) ? 'private_token=$pat' : '';
-    return optionalAuth.isEmpty
-        ? assetUrl
-        : '$assetUrl${Uri.parse(assetUrl).query.isEmpty ? '?' : '&'}$optionalAuth';
-  }
+  ) async => assetUrl;
 
   @override
   Future<APKDetails> getLatestAPKDetails(
@@ -131,16 +123,11 @@ class GitLab extends AppSource {
       final names = _gh.getAppNames(standardUrl);
       final String projectUriComponent =
           '${Uri.encodeComponent(names.author)}%2F${Uri.encodeComponent(names.name)}';
-      final String? pat = await getPATIfAny(
-        hostChanged ? additionalSettings : {},
-      );
-      final String optionalAuth = (pat != null) ? 'private_token=$pat' : '';
 
       final bool trackOnly = additionalSettings['trackOnly'] == true;
 
-      // Get project ID
       final Response res0 = await sourceRequest(
-        'https://${hosts[0]}/api/v4/projects/$projectUriComponent?$optionalAuth',
+        'https://${hosts[0]}/api/v4/projects/$projectUriComponent',
         additionalSettings,
       );
       if (res0.statusCode != 200) {
@@ -153,10 +140,7 @@ class GitLab extends AppSource {
 
       // Request data from REST API
       final String releasesPath = trackOnly ? 'repository/tags' : 'releases';
-      final String query = [
-        if (optionalAuth.isNotEmpty) optionalAuth,
-        'per_page=100',
-      ].join('&');
+      const String query = 'per_page=100';
       final Response res = await sourceRequest(
         'https://${hosts[0]}/api/v4/projects/$projectUriComponent/$releasesPath?$query',
         additionalSettings,
@@ -266,14 +250,14 @@ class GitLab extends AppSource {
       finalResult = finalResult.copyWith(
         apkUrls: finalResult.apkUrls.map((apkUrl) {
           if (jobArtifactRegex.hasMatch(apkUrl.value)) {
-          return MapEntry(
-            apkUrl.key,
-            apkUrl.value.replaceFirst('/file/', '/raw/'),
-          );
-        } else {
-          return apkUrl;
-        }
-      }).toList(),
+            return MapEntry(
+              apkUrl.key,
+              apkUrl.value.replaceFirst('/file/', '/raw/'),
+            );
+          } else {
+            return apkUrl;
+          }
+        }).toList(),
       );
 
       return finalResult;

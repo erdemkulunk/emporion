@@ -12,6 +12,8 @@ import 'package:obtainium/components/generated_form_renderer.dart';
 import 'package:obtainium/custom_errors.dart';
 import 'package:obtainium/core/logging/app_logger.dart';
 import 'package:obtainium/main.dart';
+import 'package:obtainium/pages/accounts.dart';
+import 'package:obtainium/pages/fdroid_repositories.dart';
 import 'package:obtainium/pages/import_export.dart';
 import 'package:obtainium/pages/logs.dart';
 import 'package:obtainium/providers/apps_provider.dart';
@@ -82,7 +84,7 @@ class _SettingsPageState extends State<SettingsPage> {
     ColorSwatch<Object> obtainiumSwatch,
   ) async {
     final Map<ColorSwatch<Object>, String> colorsNameMap =
-        <ColorSwatch<Object>, String>{obtainiumSwatch: 'Obtainium'};
+        <ColorSwatch<Object>, String>{obtainiumSwatch: 'Emporion'};
     return ColorPicker(
       color: settingsProvider.themeColor,
       onColorChanged: (Color color) {
@@ -342,6 +344,26 @@ class _SettingsPageState extends State<SettingsPage> {
                                   SizedBox(height: 14),
                                   ImportSection(),
                                 ],
+                              ),
+                            ),
+                          ),
+                          _settingsRow(
+                            context,
+                            icon: Icons.manage_accounts_outlined,
+                            title: 'Provider accounts',
+                            onTap: () => Navigator.of(context).push(
+                              MaterialPageRoute<void>(
+                                builder: (_) => const AccountsPage(),
+                              ),
+                            ),
+                          ),
+                          _settingsRow(
+                            context,
+                            icon: Icons.verified_user_outlined,
+                            title: 'F-Droid repositories',
+                            onTap: () => Navigator.of(context).push(
+                              MaterialPageRoute<void>(
+                                builder: (_) => const FdroidRepositoriesPage(),
                               ),
                             ),
                           ),

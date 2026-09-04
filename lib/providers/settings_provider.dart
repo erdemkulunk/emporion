@@ -18,9 +18,16 @@ import 'package:device_info_plus/device_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:shared_storage/shared_storage.dart' as saf;
 
-const String obtainiumTempId = 'imranr98_obtainium_github.com';
-const String obtainiumId = 'dev.imranr.obtainium';
-const String obtainiumUrl = 'https://github.com/ImranR98/Obtainium';
+const String obtainiumTempId = 'erdemkulunk_emporion_github.com';
+const String obtainiumId = 'dev.erdem.emporion';
+const String obtainiumUrl = String.fromEnvironment(
+  'SELF_UPDATE_URL',
+  defaultValue: 'https://github.com/erdemkulunk/emporion',
+);
+const String obtainiumAssetRegex = String.fromEnvironment(
+  'SELF_UPDATE_ASSET_REGEX',
+  defaultValue: r'^emporion-.*-universal\.apk$',
+);
 const Color obtainiumThemeColor = Color(0xFF6438B5);
 
 Locale? tryParseLocale(String? localeString) {
@@ -318,6 +325,38 @@ class SettingsProvider with ChangeNotifier {
       return true;
     }
     return false;
+  }
+
+  Map<String, dynamic>? get pendingInstall {
+    final value = _getString('emporionPendingInstall');
+    if (value == null) return null;
+    try {
+      return Map<String, dynamic>.from(jsonDecode(value) as Map);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> markPendingInstall({
+    required String appId,
+    required List<String> artifactPaths,
+    int? expectedVersionCode,
+    bool selfUpdate = false,
+  }) async {
+    await prefs?.setString(
+      'emporionPendingInstall',
+      jsonEncode({
+        'appId': appId,
+        'artifactPaths': artifactPaths,
+        'expectedVersionCode': expectedVersionCode,
+        'selfUpdate': selfUpdate,
+        'createdAt': DateTime.now().toUtc().toIso8601String(),
+      }),
+    );
+  }
+
+  Future<void> clearPendingInstall() async {
+    await prefs?.remove('emporionPendingInstall');
   }
 
   /// Prompts the user for the Android install-permission grant. Loops until
@@ -751,11 +790,11 @@ class SettingsProvider with ChangeNotifier {
   }
 
   int get exportSettings {
-    return _getInt('exportSettings') ?? 1;
+    return _getInt('exportSettings') == 0 ? 0 : 1;
   }
 
   set exportSettings(int val) {
-    prefs?.setInt('exportSettings', val > 2 || val < 0 ? 1 : val);
+    prefs?.setInt('exportSettings', val == 0 ? 0 : 1);
     notifyListeners();
   }
 

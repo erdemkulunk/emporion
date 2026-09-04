@@ -79,6 +79,10 @@ class APKDetails {
   final DateTime? releaseDate;
   final String? changeLog;
   final List<MapEntry<String, String>> allAssetUrls;
+  final Map<String, String> sha256ByUrl;
+  final Map<String, int> sizeByUrl;
+  final Map<String, String> signerByUrl;
+  final Map<String, int> versionCodeByUrl;
 
   const APKDetails(
     this.version,
@@ -87,6 +91,10 @@ class APKDetails {
     this.releaseDate,
     this.changeLog,
     this.allAssetUrls = const [],
+    this.sha256ByUrl = const {},
+    this.sizeByUrl = const {},
+    this.signerByUrl = const {},
+    this.versionCodeByUrl = const {},
   });
 
   APKDetails copyWith({
@@ -96,6 +104,10 @@ class APKDetails {
     Object? releaseDate = _sentinel,
     Object? changeLog = _sentinel,
     List<MapEntry<String, String>>? allAssetUrls,
+    Map<String, String>? sha256ByUrl,
+    Map<String, int>? sizeByUrl,
+    Map<String, String>? signerByUrl,
+    Map<String, int>? versionCodeByUrl,
   }) {
     return APKDetails(
       version ?? this.version,
@@ -106,6 +118,10 @@ class APKDetails {
           : releaseDate as DateTime?,
       changeLog: changeLog == _sentinel ? this.changeLog : changeLog as String?,
       allAssetUrls: allAssetUrls ?? this.allAssetUrls,
+      sha256ByUrl: sha256ByUrl ?? this.sha256ByUrl,
+      sizeByUrl: sizeByUrl ?? this.sizeByUrl,
+      signerByUrl: signerByUrl ?? this.signerByUrl,
+      versionCodeByUrl: versionCodeByUrl ?? this.versionCodeByUrl,
     );
   }
 }
@@ -152,6 +168,11 @@ class App {
   final String? overrideSource;
   final bool allowIdChange;
   final String? pendingRepoRenameUrl;
+  final String? accountId;
+  final String? expectedSha256;
+  final int? expectedSize;
+  final String? expectedSignerSha256;
+  final int? expectedVersionCode;
 
   const App({
     required this.id,
@@ -172,6 +193,11 @@ class App {
     this.overrideSource,
     this.allowIdChange = false,
     this.pendingRepoRenameUrl,
+    this.accountId,
+    this.expectedSha256,
+    this.expectedSize,
+    this.expectedSignerSha256,
+    this.expectedVersionCode,
   });
 
   @override
@@ -222,6 +248,11 @@ class App {
     Object? overrideSource = _sentinel,
     bool? allowIdChange,
     Object? pendingRepoRenameUrl = _sentinel,
+    Object? accountId = _sentinel,
+    Object? expectedSha256 = _sentinel,
+    Object? expectedSize = _sentinel,
+    Object? expectedSignerSha256 = _sentinel,
+    Object? expectedVersionCode = _sentinel,
   }) {
     return App(
       id: id ?? this.id,
@@ -256,6 +287,19 @@ class App {
       pendingRepoRenameUrl: pendingRepoRenameUrl == _sentinel
           ? this.pendingRepoRenameUrl
           : pendingRepoRenameUrl as String?,
+      accountId: accountId == _sentinel ? this.accountId : accountId as String?,
+      expectedSha256: expectedSha256 == _sentinel
+          ? this.expectedSha256
+          : expectedSha256 as String?,
+      expectedSize: expectedSize == _sentinel
+          ? this.expectedSize
+          : expectedSize as int?,
+      expectedSignerSha256: expectedSignerSha256 == _sentinel
+          ? this.expectedSignerSha256
+          : expectedSignerSha256 as String?,
+      expectedVersionCode: expectedVersionCode == _sentinel
+          ? this.expectedVersionCode
+          : expectedVersionCode as int?,
     );
   }
 
@@ -310,6 +354,11 @@ class App {
           jsonDecode((json['otherAssetUrls'] ?? '[]')),
         ),
         pendingRepoRenameUrl: json['pendingRepoRenameUrl'] as String?,
+        accountId: json['accountId'] as String?,
+        expectedSha256: json['expectedSha256'] as String?,
+        expectedSize: json['expectedSize'] as int?,
+        expectedSignerSha256: json['expectedSignerSha256'] as String?,
+        expectedVersionCode: json['expectedVersionCode'] as int?,
       );
     } on TypeError catch (e) {
       AppLogger.error(
@@ -340,6 +389,11 @@ class App {
     'overrideSource': overrideSource,
     'allowIdChange': allowIdChange,
     'pendingRepoRenameUrl': pendingRepoRenameUrl,
+    'accountId': accountId,
+    'expectedSha256': expectedSha256,
+    'expectedSize': expectedSize,
+    'expectedSignerSha256': expectedSignerSha256,
+    'expectedVersionCode': expectedVersionCode,
   };
 }
 
@@ -1185,6 +1239,11 @@ class SourceProvider {
       ),
     );
     if (apk.apkUrls.isEmpty && !trackOnly) {
+      if (additionalSettings['emporionSelfUpdate'] == true) {
+        throw ObtainiumError(
+          'No exact Emporion universal APK matched. Open the release page and review its signed assets.',
+        )..url = '$standardUrl/releases';
+      }
       throw NoAPKError()..url = standardUrl;
     }
     if (additionalSettings['autoApkFilterByArch'] == true) {
@@ -1193,8 +1252,23 @@ class SourceProvider {
         throw NoAPKError()..url = standardUrl;
       }
     }
+    if (additionalSettings['emporionSelfUpdate'] == true &&
+        apk.apkUrls.length != 1) {
+      throw ObtainiumError(
+        'Emporion self-update requires exactly one universal APK; found ${apk.apkUrls.length}.',
+      )..url = '$standardUrl/releases';
+    }
     var name = currentApp != null ? currentApp.name.trim() : '';
     name = name.isNotEmpty ? name : apk.names.name;
+    final preferredApkIndex = apk.apkUrls.isEmpty
+        ? 0
+        : (currentApp?.preferredApkIndex ?? apk.apkUrls.length - 1).clamp(
+            0,
+            apk.apkUrls.length - 1,
+          );
+    final selectedApkUrl = apk.apkUrls.isEmpty
+        ? null
+        : apk.apkUrls[preferredApkIndex].value;
     final App finalApp = App(
       id: await _resolveAppId(
         source,
@@ -1210,9 +1284,7 @@ class SourceProvider {
       installedVersion: currentApp?.installedVersion,
       latestVersion: apk.version,
       apkUrls: apk.apkUrls,
-      preferredApkIndex:
-          currentApp?.preferredApkIndex ??
-          (apk.apkUrls.isNotEmpty ? apk.apkUrls.length - 1 : 0),
+      preferredApkIndex: preferredApkIndex,
       additionalSettings: additionalSettings,
       lastUpdateCheck: DateTime.now(),
       pinned: currentApp?.pinned ?? false,
@@ -1228,6 +1300,20 @@ class SourceProvider {
       otherAssetUrls: apk.allAssetUrls
           .where((a) => apk.apkUrls.indexWhere((p) => a.key == p.key) < 0)
           .toList(),
+      accountId:
+          additionalSettings['accountId'] as String? ?? currentApp?.accountId,
+      expectedSha256: selectedApkUrl == null
+          ? null
+          : apk.sha256ByUrl[selectedApkUrl],
+      expectedSize: selectedApkUrl == null
+          ? null
+          : apk.sizeByUrl[selectedApkUrl],
+      expectedSignerSha256: selectedApkUrl == null
+          ? null
+          : apk.signerByUrl[selectedApkUrl],
+      expectedVersionCode: selectedApkUrl == null
+          ? null
+          : apk.versionCodeByUrl[selectedApkUrl],
     );
     return source.postProcessApp(finalApp);
   }
@@ -1333,6 +1419,7 @@ class HttpService {
   /// Headers that must never be forwarded to a different origin on redirect.
   static const Set<String> sensitiveRedirectHeaders = {
     'authorization',
+    'private-token',
     'proxy-authorization',
     'cookie',
   };
@@ -1356,7 +1443,7 @@ class HttpService {
       'assets/ca-certs/harica-tls-root-2021-rsa.crt',
       'assets/ca-certs/harica-tls-root-2021-ecc.crt',
       'assets/ca-certs/russian-mintsifry-root.crt',
-    ])
+    ]),
   };
 
   static Future<List<Uint8List>> _loadCertificateFromAsset(
@@ -1372,9 +1459,7 @@ class HttpService {
 
   static String _extractRootHost(String host) {
     final parts = host.split('.');
-    return parts.length > 2
-        ? parts.sublist(parts.length - 2).join('.')
-        : host;
+    return parts.length > 2 ? parts.sublist(parts.length - 2).join('.') : host;
   }
 
   Future<SecurityContext?> _createCertPinning(String url) async {
@@ -1388,16 +1473,14 @@ class HttpService {
         securityContext.setTrustedCertificatesBytes(certBytes);
       }
       return securityContext;
-    }
-    else if (_certificatePins.containsKey(rootHost)) {
+    } else if (_certificatePins.containsKey(rootHost)) {
       final certsBytes = await _certificatePins[rootHost]!;
       final securityContext = SecurityContext();
       for (final certBytes in certsBytes) {
         securityContext.setTrustedCertificatesBytes(certBytes);
       }
       return securityContext;
-    }
-    else {
+    } else {
       return null;
     }
   }
@@ -1409,7 +1492,9 @@ class HttpService {
    */
   Future<SecurityContext> _ruStoreWorkaroundSecurityContext() async {
     final securityContext = SecurityContext(withTrustedRoots: true);
-    final cert = await rootBundle.load('assets/ca-certs/russian-mintsifry-root.crt');
+    final cert = await rootBundle.load(
+      'assets/ca-certs/russian-mintsifry-root.crt',
+    );
     securityContext.setTrustedCertificatesBytes(cert.buffer.asUint8List());
     return securityContext;
   }
@@ -1424,8 +1509,7 @@ class HttpService {
     final host = Uri.parse(url).host;
     if (pinning) {
       securityContext = await _createCertPinning(url);
-    }
-    else if (_extractRootHost(host) == 'rustore.ru') {
+    } else if (_extractRootHost(host) == 'rustore.ru') {
       securityContext = await _ruStoreWorkaroundSecurityContext();
     }
     final client = securityContext != null
@@ -1474,6 +1558,23 @@ class HttpService {
   }) async {
     final url = additionalSettings['url'] as String;
     var currentUrl = Uri.parse(url);
+    bool allowedUri(Uri uri, {bool redirect = false}) =>
+        uri.isAbsolute &&
+        uri.host.isNotEmpty &&
+        uri.userInfo.isEmpty &&
+        (uri.scheme.toLowerCase() == 'https' ||
+            ((additionalSettings['allowInsecure'] == true ||
+                    (redirect &&
+                        additionalSettings['allowInsecureRedirects'] ==
+                            true)) &&
+                uri.scheme.toLowerCase() == 'http'));
+    if (!allowedUri(currentUrl)) {
+      throw ObtainiumError(
+        additionalSettings['allowInsecure'] == true
+            ? 'Only credential-free HTTP(S) URLs are allowed'
+            : 'A credential-free HTTPS URL is required',
+      )..url = url;
+    }
     var redirectCount = 0;
     List<Cookie> cookies = [];
     HttpClient? httpClient;
@@ -1502,6 +1603,11 @@ class HttpService {
         final location = response.headers.value(HttpHeaders.locationHeader);
         if (location != null) {
           final nextUrl = Uri.parse(ensureAbsoluteUrl(location, currentUrl));
+          if (!allowedUri(nextUrl, redirect: true)) {
+            httpClient.close();
+            throw ObtainiumError('Unsafe redirect URL rejected')
+              ..url = nextUrl.toString();
+          }
           if (currentUrl.scheme == 'https' &&
               nextUrl.scheme == 'http' &&
               additionalSettings['allowInsecure'] != true &&
@@ -1789,7 +1895,7 @@ bool isAppUpdateable(App app, SettingsProvider settingsProvider) {
   if (installed == null || installed == latest) {
     return false;
   }
-  if (!settingsProvider.hideDowngrades) {
+  if (!settingsProvider.hideDowngrades || isVersionPseudo(app)) {
     return true;
   }
   final comparison = VersionService().compareVersionsNumerically(

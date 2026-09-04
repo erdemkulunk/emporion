@@ -1,4 +1,5 @@
 import 'package:obtainium/app_sources/fdroid.dart';
+import 'package:obtainium/app_sources/fdroidrepo.dart';
 import 'package:obtainium/components/generated_form_model.dart';
 import 'package:obtainium/custom_errors.dart';
 import 'package:obtainium/providers/source_provider.dart';
@@ -52,15 +53,9 @@ class IzzyOnDroid extends AppSource {
       if (appId == null) {
         throw NoReleasesError();
       }
-      return fd.getAPKUrlsFromFDroidPackagesAPIResponse(
-        await sourceRequest(
-          'https://apt.izzysoft.de/fdroid/api/v1/packages/$appId',
-          additionalSettings,
-        ),
-        'https://android.izzysoft.de/frepo/$appId',
-        standardUrl,
-        name,
-        additionalSettings: additionalSettings,
+      return await FDroidRepo().getLatestAPKDetails(
+        'https://apt.izzysoft.de/fdroid/repo?appId=${Uri.encodeQueryComponent(appId)}',
+        {...additionalSettings, 'appIdOrName': appId},
       );
     } catch (e) {
       rethrowOrWrapError(e);

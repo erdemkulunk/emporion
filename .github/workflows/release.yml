@@ -5,76 +5,106 @@ on:
     inputs:
       beta:
         type: boolean
-        description: Is beta?
+        description: Publish as a prerelease
+        default: false
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      SELF_UPDATE_URL: https://github.com/erdemkulunk/emporion
+      SELF_UPDATE_ASSET_REGEX: '^emporion-.*-universal\.apk$'
 
     steps:
-      
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          submodules: recursive
+
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+          cache: true
+
       - uses: actions/setup-java@v4
         with:
-          distribution: 'temurin' # See 'Supported distributions' for available options
+          distribution: temurin
           java-version: '21'
 
-      - name: Flutter Doctor
-        id: flutter_doctor
+      - name: Validate release secrets
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          flutter doctor -v
+          test -n "$KEYSTORE_BASE64"
+          test -n "$KEYSTORE_PASSWORD"
+          test -n "$KEY_ALIAS"
+          test -n "$KEY_PASSWORD"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > android/app/emporion-release.jks
+          {
+            printf 'storeFile=emporion-release.jks\n'
+            printf 'storePassword=%s\n' "$KEYSTORE_PASSWORD"
+            printf 'keyAlias=%s\n' "$KEY_ALIAS"
+            printf 'keyPassword=%s\n' "$KEY_PASSWORD"
+          } > android/key.properties
 
-      - name: Check submodule
+      - name: Extract version
+        id: version
+        shell: bash
         run: |
-          git submodule update --init --recursive
+          VERSION="$(sed -n 's/^version: \([^+]*\).*/\1/p' pubspec.yaml)"
+          test -n "$VERSION"
+          printf 'value=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+          printf 'tag=v%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Extract Version
-        id: extract_version      
-        run: |
-          VERSION=$(grep -oP "^version: [^\+]+" pubspec.yaml | tail -c +10)
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          if [ ${{ inputs.beta }} == true ]; then BETA=true; else BETA=false; fi
-          echo "beta=$BETA" >> $GITHUB_OUTPUT
-          TAG="v$VERSION"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-
-      - name: Build APKs
+      - name: Analyze and test
         run: |
           flutter pub get
-          # TODO: Remove once Flutter's libdartjni.so no longer embeds a non-reproducible build ID
-          sed -i -e 's/-Wl,/-Wl,--build-id=none,/' ${PUB_CACHE:-$HOME/.pub-cache}/hosted/*/jni-*/src/CMakeLists.txt
-          # No key.properties exists in CI, so build.gradle.kts already sets
-          # signingConfig = null and produces unsigned APKs (signing happens
-          # separately in the sign.sh script).
-          flutter build apk --flavor normal && flutter build apk --split-per-abi --flavor normal
-          for file in build/app/outputs/flutter-apk/app-*normal*.apk*; do mv "$file" "${file//-normal/}"; done
-          flutter build apk --flavor fdroid -t lib/main_fdroid.dart && flutter build apk --split-per-abi --flavor fdroid -t lib/main_fdroid.dart
-          rm -f ./build/app/outputs/flutter-apk/*.sha1
-          cp ./sign.sh ./build/app/outputs/flutter-apk/
-          ls -l ./build/app/outputs/flutter-apk/
+          flutter analyze
+          flutter test
 
-      - name: Save Unsigned APKs as Action Artifacts
+      - name: Build signed release APKs
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          rm -rf dist
+          mkdir dist
+          flutter build apk --release --flavor normal \
+            --dart-define=SELF_UPDATE_URL="$SELF_UPDATE_URL" \
+            --dart-define=SELF_UPDATE_ASSET_REGEX="$SELF_UPDATE_ASSET_REGEX"
+          cp build/app/outputs/flutter-apk/app-normal-release.apk \
+            "dist/emporion-$VERSION-universal.apk"
+          flutter build apk --release --split-per-abi --flavor normal \
+            --dart-define=SELF_UPDATE_URL="$SELF_UPDATE_URL" \
+            --dart-define=SELF_UPDATE_ASSET_REGEX="$SELF_UPDATE_ASSET_REGEX"
+          cp build/app/outputs/flutter-apk/app-armeabi-v7a-normal-release.apk \
+            "dist/emporion-$VERSION-armeabi-v7a.apk"
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-normal-release.apk \
+            "dist/emporion-$VERSION-arm64-v8a.apk"
+          cp build/app/outputs/flutter-apk/app-x86_64-normal-release.apk \
+            "dist/emporion-$VERSION-x86_64.apk"
+          (cd dist && sha256sum emporion-*.apk > SHA256SUMS)
+
+      - name: Upload signed artifacts
         uses: actions/upload-artifact@v4
         with:
-          path: build/app/outputs/flutter-apk/*
+          name: emporion-${{ steps.version.outputs.value }}
+          path: dist/*
+          if-no-files-found: error
 
-      - name: Create Tag
-        uses: mathieudutour/github-tag-action@v6.1
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
         with:
-          github_token: ${{ secrets.GH_ACCESS_TOKEN }}
-          custom_tag: "${{ steps.extract_version.outputs.tag }}"
-          tag_prefix: ""
-      
-      - name: Create Draft Release
-        uses: ncipollo/release-action@v1
-        with:
-          token: ${{ secrets.GH_ACCESS_TOKEN }}
-          tag: "${{ steps.extract_version.outputs.tag }}"
-          prerelease: "${{ steps.extract_version.outputs.beta }}"
-          draft: "true"
-          generateReleaseNotes: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          prerelease: ${{ inputs.beta }}
+          draft: false
+          generate_release_notes: true
+          files: dist/*

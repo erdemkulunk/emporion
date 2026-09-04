@@ -1,4 +1,4 @@
-package dev.imranr.obtainium
+package dev.erdem.emporion
 
 import android.content.Intent
 import android.net.Uri
@@ -17,7 +17,7 @@ import java.io.File
  */
 class MainActivity : FlutterActivity() {
     private companion object {
-        const val EXTERNAL_INSTALL_CHANNEL = "dev.imranr.obtainium/external_install"
+        const val EXTERNAL_INSTALL_CHANNEL = "dev.erdem.emporion/external_install"
         const val APK_MIME = "application/vnd.android.package-archive"
     }
 
@@ -76,7 +76,7 @@ class MainActivity : FlutterActivity() {
      */
     private fun listInstallTargets(): List<Map<String, String>> {
         val targets = ArrayList<Map<String, String>>()
-        val probe = Uri.parse("content://dev.imranr.obtainium.probe/sample.apk")
+        val probe = Uri.parse("content://dev.erdem.emporion.probe/sample.apk")
         val actions = listOf(Intent.ACTION_VIEW, Intent.ACTION_INSTALL_PACKAGE)
         for (action in actions) {
             @Suppress("DEPRECATION")
@@ -106,7 +106,7 @@ class MainActivity : FlutterActivity() {
                 val url = match.value.trimEnd('.', ',', ';', '!', '?', ')') // Trim potential trailing punctuation
                 intent.apply { // "Redirect" the intent
                     action = Intent.ACTION_VIEW
-                    data = Uri.parse("obtainium://add/${Uri.encode(url)}")
+                    data = Uri.parse("emporion://add/${Uri.encode(url)}")
                 }
             } else {
                 Toast.makeText(this, "No URL found in shared text", Toast.LENGTH_SHORT).show()

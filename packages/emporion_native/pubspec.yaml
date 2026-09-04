@@ -1,0 +1,19 @@
+name: emporion_native
+description: Android-native security bridges for Emporion Flutter engines.
+version: 1.0.0
+publish_to: none
+
+environment:
+  sdk: ^3.12.0
+  flutter: ">=3.44.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: dev.erdem.emporion
+        pluginClass: EmporionNativePlugin

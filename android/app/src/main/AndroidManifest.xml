@@ -1,6 +1,5 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools"
-    package="dev.imranr.obtainium">
+    xmlns:tools="http://schemas.android.com/tools">
     <application
         android:label="@string/label"
         android:name="${applicationName}"
@@ -9,6 +8,9 @@
         android:requestLegacyExternalStorage="true"
         android:usesCleartextTraffic="true"
         android:localeConfig="@xml/locales_config"
+        android:allowBackup="true"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:memtagMode="async">
         <activity
             android:name=".MainActivity"
@@ -44,8 +46,11 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="obtainium" />
+                <data android:scheme="emporion" />
             </intent-filter>
+            <meta-data
+                android:name="flutter_deeplinking_enabled"
+                android:value="false" />
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -76,7 +81,7 @@
             android:name="com.dexterous.flutterlocalnotifications.ActionBroadcastReceiver"
             android:exported="false" />
         <meta-data
-            android:name="dev.imranr.obtainium.service.NOTIFICATION_ICON"
+            android:name="dev.erdem.emporion.service.NOTIFICATION_ICON"
             android:resource="@drawable/ic_notification" />
     </application>
     <uses-feature android:name="android.hardware.touchscreen" android:required="false"/>

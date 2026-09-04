@@ -91,9 +91,24 @@ class StockInstaller extends Installer {
     required String appId,
     Map<String, dynamic> installOptions = const {},
   }) async {
-    final code = await AndroidPackageInstaller.installApk(
-      apkFilePath: apkFilePaths.join(','),
+    // Permission can be revoked while a download is running; recheck at the
+    // final boundary immediately before opening PackageInstaller.
+    await ensurePermission();
+    await settingsProvider.markPendingInstall(
+      appId: appId,
+      artifactPaths: apkFilePaths,
+      expectedVersionCode: installOptions['expectedVersionCode'] as int?,
+      selfUpdate: installOptions['selfUpdate'] == true,
     );
-    return InstallResult.fromPlatformCode(code);
+    try {
+      final code = await AndroidPackageInstaller.installApk(
+        apkFilePath: apkFilePaths.join(','),
+      );
+      await settingsProvider.clearPendingInstall();
+      return InstallResult.fromPlatformCode(code);
+    } catch (_) {
+      await settingsProvider.clearPendingInstall();
+      rethrow;
+    }
   }
 }

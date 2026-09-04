@@ -76,9 +76,9 @@ Never rethrowOrWrapError(
     if (error.unexpected) {
       final resolvedStack = error.stack ?? StackTrace.current;
       AppLogger.error(
-        'Unexpected ObtainiumError: ${error.toString()}\n$resolvedStack',
+        'Unexpected EmporionError: ${error.toString()}\n$resolvedStack',
         message:
-            'Unexpected ObtainiumError: ${error.toString()}\n$resolvedStack',
+            'Unexpected EmporionError: ${error.toString()}\n$resolvedStack',
       );
       throw error;
     }

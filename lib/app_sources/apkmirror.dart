@@ -47,7 +47,7 @@ class APKMirror extends AppSource {
   }) async {
     return {
       'User-Agent':
-          'Obtainium/${(await getInstalledInfo(obtainiumId))?.versionName ?? _fallbackVersion}',
+          'Emporion/${(await getInstalledInfo(obtainiumId))?.versionName ?? _fallbackVersion}',
     };
   }
 
